@@ -1,19 +1,35 @@
 import logging
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
+import zstandard
 from hypercorn import Config
 from hypercorn.logging import Logger as HypercornLogger
 from loguru import logger
+
+_MAX_LOG_ARCHIVES = 5
+
+
+def _zstd_compress(filepath: str) -> None:
+    source = Path(filepath)
+    dest = source.with_suffix(source.suffix + ".zst")
+    cctx = zstandard.ZstdCompressor()
+    with open(source, "rb") as f_in, open(dest, "wb") as f_out:
+        cctx.copy_stream(f_in, f_out)
+    source.unlink()
+
+
+def _once_then_never() -> Iterator[bool]:
+    yield True
+    while True:
+        yield False
 
 
 class InterceptLogger(HypercornLogger):
     def __init__(self, config: Config):
         super().__init__(config)
         assert self.error_logger
-        # TODO: Decide if we want to provide access logs
-        # assert self.access_logger
-        # self.access_logger.handlers = [_InterceptHandler()]
         self.error_logger.handlers = [_InterceptHandler()]
 
 
@@ -29,6 +45,12 @@ class _InterceptHandler(logging.Handler):
 
 def logger_setup(log_file: Path | None, verbosity: int = 0):
     """Set up logging for this process - formatting, file handles, verbosity and output"""
+
+    logging.getLogger("exo_rs").setLevel(logging.INFO)
+    logging.getLogger("networking").setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     logger.remove()
 
     # replace all stdlib loggers with _InterceptHandlers that log to loguru
@@ -45,19 +67,22 @@ def logger_setup(log_file: Path | None, verbosity: int = 0):
     else:
         logger.add(
             sys.__stderr__,  # type: ignore
-            format="[ {time:HH:mm:ss.SSS} | <level>{level: <8}</level> | {name}:{function}:{line} ] <level>{message}</level>",
+            format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | <level>{level: <8}</level> | {name}:{function}:{line} ] <level>{message}</level>",
             level="DEBUG",
             colorize=True,
             enqueue=True,
         )
     if log_file:
+        rotate_once = _once_then_never()
         logger.add(
             log_file,
             format="[ {time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} ] {message}",
-            level="INFO",
+            level="DEBUG" if verbosity > 0 else "INFO",
             colorize=False,
             enqueue=True,
-            rotation="1 week",
+            rotation=lambda _, __: next(rotate_once),
+            retention=_MAX_LOG_ARCHIVES,
+            compression=_zstd_compress,
         )
 
 

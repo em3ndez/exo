@@ -35,12 +35,22 @@ struct NetworkStatus: Equatable {
     let thunderboltBridgeState: ThunderboltState?
     let bridgeInactive: Bool?
     let interfaceStatuses: [InterfaceIpStatus]
+    let localRdmaDevices: [String]
+    let localRdmaActivePorts: [RDMAPort]
 
     static let empty = NetworkStatus(
         thunderboltBridgeState: nil,
         bridgeInactive: nil,
-        interfaceStatuses: []
+        interfaceStatuses: [],
+        localRdmaDevices: [],
+        localRdmaActivePorts: []
     )
+}
+
+struct RDMAPort: Equatable {
+    let device: String
+    let port: String
+    let state: String
 }
 
 struct InterfaceIpStatus: Equatable {
@@ -59,36 +69,82 @@ private struct NetworkStatusFetcher {
         NetworkStatus(
             thunderboltBridgeState: readThunderboltBridgeState(),
             bridgeInactive: readBridgeInactive(),
-            interfaceStatuses: readInterfaceStatuses()
+            interfaceStatuses: readInterfaceStatuses(),
+            localRdmaDevices: readRDMADevices(),
+            localRdmaActivePorts: readRDMAActivePorts()
         )
     }
 
-    private func readThunderboltBridgeState() -> ThunderboltState? {
-        let result = runCommand(["networksetup", "-getnetworkserviceenabled", "Thunderbolt Bridge"])
-        guard result.exitCode == 0 else {
-            let lower = result.output.lowercased() + result.error.lowercased()
-            if lower.contains("not a recognized network service") {
-                return .deleted
+    private func readRDMADevices() -> [String] {
+        let result = runCommand(["ibv_devices"])
+        guard result.exitCode == 0 else { return [] }
+        var devices: [String] = []
+        for line in result.output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("---") || trimmed.lowercased().hasPrefix("device")
+                || trimmed.isEmpty
+            {
+                continue
             }
+            let parts = trimmed.split(separator: " ", maxSplits: 1)
+            if let deviceName = parts.first {
+                devices.append(String(deviceName))
+            }
+        }
+        return devices
+    }
+
+    private func readRDMAActivePorts() -> [RDMAPort] {
+        let result = runCommand(["ibv_devinfo"])
+        guard result.exitCode == 0 else { return [] }
+        var ports: [RDMAPort] = []
+        var currentDevice: String?
+        var currentPort: String?
+
+        for line in result.output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("hca_id:") {
+                currentDevice = trimmed.replacingOccurrences(of: "hca_id:", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+            } else if trimmed.hasPrefix("port:") {
+                currentPort = trimmed.replacingOccurrences(of: "port:", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+            } else if trimmed.hasPrefix("state:") {
+                let state = trimmed.replacingOccurrences(of: "state:", with: "").trimmingCharacters(
+                    in: .whitespaces)
+                if let device = currentDevice, let port = currentPort {
+                    if state.lowercased().contains("active") {
+                        ports.append(RDMAPort(device: device, port: port, state: state))
+                    }
+                }
+            }
+        }
+        return ports
+    }
+
+    private func readThunderboltBridgeState() -> ThunderboltState? {
+        // Dynamically find the Thunderbolt Bridge service (don't assume the name)
+        guard let serviceName = ThunderboltBridgeDetector.findThunderboltBridgeServiceName() else {
+            // No bridge containing Thunderbolt interfaces exists
+            return .deleted
+        }
+
+        guard let isEnabled = ThunderboltBridgeDetector.isServiceEnabled(serviceName: serviceName)
+        else {
             return nil
         }
-        let output = result.output.lowercased()
-        if output.contains("enabled") {
-            return .enabled
-        }
-        if output.contains("disabled") {
-            return .disabled
-        }
-        return nil
+
+        return isEnabled ? .enabled : .disabled
     }
 
     private func readBridgeInactive() -> Bool? {
         let result = runCommand(["ifconfig", "bridge0"])
         guard result.exitCode == 0 else { return nil }
-        guard let statusLine = result.output
-            .components(separatedBy: .newlines)
-            .first(where: { $0.contains("status:") })?
-            .lowercased()
+        guard
+            let statusLine = result.output
+                .components(separatedBy: .newlines)
+                .first(where: { $0.contains("status:") })?
+                .lowercased()
         else {
             return nil
         }
@@ -171,4 +227,3 @@ private struct NetworkStatusFetcher {
         )
     }
 }
-

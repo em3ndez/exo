@@ -1,12 +1,14 @@
 import exo.worker.plan as plan_mod
 from exo.shared.types.common import NodeId
+from exo.shared.types.memory import Memory
 from exo.shared.types.tasks import LoadModel
 from exo.shared.types.worker.downloads import DownloadCompleted, DownloadProgress
 from exo.shared.types.worker.instances import BoundInstance
 from exo.shared.types.worker.runners import (
-    RunnerWaitingForModel,
+    RunnerConnected,
+    RunnerIdle,
 )
-from exo.shared.types.worker.shards import ShardMetadata
+from exo.utils.keyed_backoff import KeyedBackoff
 from exo.worker.tests.constants import (
     INSTANCE_1_ID,
     MODEL_A_ID,
@@ -38,25 +40,23 @@ def test_plan_requests_download_when_waiting_and_shard_not_downloaded():
     bound_instance = BoundInstance(
         instance=instance, bound_runner_id=RUNNER_1_ID, bound_node_id=NODE_A
     )
-    runner = FakeRunnerSupervisor(
-        bound_instance=bound_instance, status=RunnerWaitingForModel()
-    )
+    runner = FakeRunnerSupervisor(bound_instance=bound_instance, status=RunnerIdle())
 
     runners = {RUNNER_1_ID: runner}
     instances = {INSTANCE_1_ID: instance}
-    all_runners = {RUNNER_1_ID: RunnerWaitingForModel()}
-
-    # No entry for this shard -> should trigger DownloadModel
-    download_status: dict[ShardMetadata, DownloadProgress] = {}
+    all_runners = {RUNNER_1_ID: RunnerIdle()}
 
     result = plan_mod.plan(
         node_id=NODE_A,
         runners=runners,  # type: ignore
-        download_status=download_status,
         global_download_status={NODE_A: []},
         instances=instances,
         all_runners=all_runners,
         tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
     )
 
     assert isinstance(result, plan_mod.DownloadModel)
@@ -82,36 +82,37 @@ def test_plan_loads_model_when_all_shards_downloaded_and_waiting():
         instance=instance, bound_runner_id=RUNNER_1_ID, bound_node_id=NODE_A
     )
     local_runner = FakeRunnerSupervisor(
-        bound_instance=bound_instance, status=RunnerWaitingForModel()
+        bound_instance=bound_instance, status=RunnerConnected()
     )
 
     runners = {RUNNER_1_ID: local_runner}
     instances = {INSTANCE_1_ID: instance}
 
     all_runners = {
-        RUNNER_1_ID: RunnerWaitingForModel(),
-        RUNNER_2_ID: RunnerWaitingForModel(),
+        RUNNER_1_ID: RunnerConnected(),
+        RUNNER_2_ID: RunnerConnected(),
     }
 
-    # Local node has already marked its shard as downloaded (not actually used by _load_model)
-    local_download_status = {
-        shard1: DownloadCompleted(shard_metadata=shard1, node_id=NODE_A)  # type: ignore[reportUnhashable]
-    }
-
-    # Global view has completed downloads for both nodes
     global_download_status = {
-        NODE_A: [DownloadCompleted(shard_metadata=shard1, node_id=NODE_A)],
-        NODE_B: [DownloadCompleted(shard_metadata=shard2, node_id=NODE_B)],
+        NODE_A: [
+            DownloadCompleted(shard_metadata=shard1, node_id=NODE_A, total=Memory())
+        ],
+        NODE_B: [
+            DownloadCompleted(shard_metadata=shard2, node_id=NODE_B, total=Memory())
+        ],
     }
 
     result = plan_mod.plan(
         node_id=NODE_A,
         runners=runners,  # type: ignore
-        download_status=local_download_status,
         global_download_status=global_download_status,
         instances=instances,
         all_runners=all_runners,
         tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
     )
 
     assert isinstance(result, LoadModel)
@@ -133,36 +134,34 @@ def test_plan_does_not_request_download_when_shard_already_downloaded():
     bound_instance = BoundInstance(
         instance=instance, bound_runner_id=RUNNER_1_ID, bound_node_id=NODE_A
     )
-    runner = FakeRunnerSupervisor(
-        bound_instance=bound_instance, status=RunnerWaitingForModel()
-    )
+    runner = FakeRunnerSupervisor(bound_instance=bound_instance, status=RunnerIdle())
 
     runners = {RUNNER_1_ID: runner}
     instances = {INSTANCE_1_ID: instance}
-    all_runners = {RUNNER_1_ID: RunnerWaitingForModel()}
+    all_runners = {RUNNER_1_ID: RunnerIdle()}
 
-    # Local status claims the shard is downloaded already
-    local_download_status = {
-        shard: DownloadCompleted(shard_metadata=shard, node_id=NODE_A)  # type: ignore[reportUnhashable]
-    }
-
-    # Global view hasn't caught up yet (no completed shards recorded for NODE_A)
+    # Global state shows shard is downloaded for NODE_A
     global_download_status: dict[NodeId, list[DownloadProgress]] = {
-        NODE_A: [],
+        NODE_A: [
+            DownloadCompleted(shard_metadata=shard, node_id=NODE_A, total=Memory())
+        ],
         NODE_B: [],
     }
 
     result = plan_mod.plan(
         node_id=NODE_A,
         runners=runners,  # type: ignore
-        download_status=local_download_status,
         global_download_status=global_download_status,
         instances=instances,
         all_runners=all_runners,
         tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
     )
 
-    assert result is None
+    assert not isinstance(result, plan_mod.DownloadModel)
 
 
 def test_plan_does_not_load_model_until_all_shards_downloaded_globally():
@@ -183,33 +182,58 @@ def test_plan_does_not_load_model_until_all_shards_downloaded_globally():
         instance=instance, bound_runner_id=RUNNER_1_ID, bound_node_id=NODE_A
     )
     local_runner = FakeRunnerSupervisor(
-        bound_instance=bound_instance, status=RunnerWaitingForModel()
+        bound_instance=bound_instance, status=RunnerConnected()
     )
 
     runners = {RUNNER_1_ID: local_runner}
     instances = {INSTANCE_1_ID: instance}
     all_runners = {
-        RUNNER_1_ID: RunnerWaitingForModel(),
-        RUNNER_2_ID: RunnerWaitingForModel(),
+        RUNNER_1_ID: RunnerConnected(),
+        RUNNER_2_ID: RunnerConnected(),
     }
 
-    # Only NODE_A's shard is recorded as downloaded globally
-    local_download_status = {
-        shard1: DownloadCompleted(shard_metadata=shard1, node_id=NODE_A)  # type: ignore[reportUnhashable]
-    }
     global_download_status = {
-        NODE_A: [DownloadCompleted(shard_metadata=shard1, node_id=NODE_A)],
+        NODE_A: [
+            DownloadCompleted(shard_metadata=shard1, node_id=NODE_A, total=Memory())
+        ],
         NODE_B: [],  # NODE_B has no downloads completed yet
     }
 
     result = plan_mod.plan(
         node_id=NODE_A,
         runners=runners,  # type: ignore
-        download_status=local_download_status,
         global_download_status=global_download_status,
         instances=instances,
         all_runners=all_runners,
         tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
     )
 
     assert result is None
+
+    global_download_status = {
+        NODE_A: [
+            DownloadCompleted(shard_metadata=shard1, node_id=NODE_A, total=Memory())
+        ],
+        NODE_B: [
+            DownloadCompleted(shard_metadata=shard2, node_id=NODE_B, total=Memory())
+        ],  # NODE_B has no downloads completed yet
+    }
+
+    result = plan_mod.plan(
+        node_id=NODE_A,
+        runners=runners,  # type: ignore
+        global_download_status=global_download_status,
+        instances=instances,
+        all_runners=all_runners,
+        tasks={},
+        input_chunk_buffer={},
+        image_cache={},
+        instance_backoff=KeyedBackoff(),
+        download_backoff=KeyedBackoff(),
+    )
+
+    assert result is not None

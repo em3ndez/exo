@@ -1,441 +1,851 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import {
-		topologyData,
-		downloads,
-		type DownloadProgress,
-		refreshState,
-		lastUpdate as lastUpdateStore
-	} from '$lib/stores/app.svelte';
-	import HeaderNav from '$lib/components/HeaderNav.svelte';
+  import { onMount } from "svelte";
+  import { fade, fly } from "svelte/transition";
+  import { cubicOut } from "svelte/easing";
+  import {
+    topologyData,
+    downloads,
+    nodeDisk,
+    refreshState,
+    lastUpdate as lastUpdateStore,
+    startDownload,
+    cancelDownload,
+    deleteDownload,
+  } from "$lib/stores/app.svelte";
+  import {
+    getDownloadTag,
+    extractModelIdFromDownload,
+    extractShardMetadata,
+  } from "$lib/utils/downloads";
+  import HeaderNav from "$lib/components/HeaderNav.svelte";
 
-	type FileProgress = {
-		name: string;
-		totalBytes: number;
-		downloadedBytes: number;
-		speed: number;
-		etaMs: number;
-		percentage: number;
-	};
+  type CellStatus =
+    | { kind: "completed"; totalBytes: number; modelDirectory?: string }
+    | {
+        kind: "downloading";
+        percentage: number;
+        downloadedBytes: number;
+        totalBytes: number;
+        speed: number;
+        etaMs: number;
+        modelDirectory?: string;
+      }
+    | {
+        kind: "pending";
+        downloaded: number;
+        total: number;
+        modelDirectory?: string;
+      }
+    | { kind: "failed"; modelDirectory?: string }
+    | { kind: "not_present" };
 
-	type ModelEntry = {
-		modelId: string;
-		prettyName?: string | null;
-		percentage: number;
-		downloadedBytes: number;
-		totalBytes: number;
-		speed: number;
-		etaMs: number;
-		status: 'completed' | 'downloading';
-		files: FileProgress[];
-	};
+  type ModelCardInfo = {
+    family: string;
+    quantization: string;
+    baseModel: string;
+    capabilities: string[];
+    storageSize: number;
+    nLayers: number;
+    supportsTensor: boolean;
+  };
 
-	type NodeEntry = {
-		nodeId: string;
-		nodeName: string;
-		models: ModelEntry[];
-	};
+  type ModelRow = {
+    modelId: string;
+    prettyName: string | null;
+    cells: Record<string, CellStatus>;
+    shardMetadata: Record<string, unknown> | null;
+    modelCard: ModelCardInfo | null;
+  };
 
-	const data = $derived(topologyData());
-	const downloadsData = $derived(downloads());
+  type NodeColumn = {
+    nodeId: string;
+    label: string;
+    diskAvailable?: number;
+    diskTotal?: number;
+  };
 
-	function getNodeLabel(nodeId: string): string {
-		const node = data?.nodes?.[nodeId];
-		if (!node) return nodeId.slice(0, 8);
-		return node.friendly_name || node.system_info?.model_id || nodeId.slice(0, 8);
-	}
+  const data = $derived(topologyData());
+  const downloadsData = $derived(downloads());
+  const nodeDiskData = $derived(nodeDisk());
 
-	function getBytes(value: unknown): number {
-		if (typeof value === 'number') return value;
-		if (value && typeof value === 'object') {
-			const v = value as Record<string, unknown>;
-			if (typeof v.in_bytes === 'number') return v.in_bytes;
-			if (typeof v.inBytes === 'number') return v.inBytes;
-		}
-		return 0;
-	}
+  function getNodeLabel(nodeId: string): string {
+    const node = data?.nodes?.[nodeId];
+    if (!node) return nodeId.slice(0, 8);
+    return (
+      node.friendly_name || node.system_info?.model_id || nodeId.slice(0, 8)
+    );
+  }
 
-	function formatBytes(bytes: number): string {
-		if (!bytes || bytes <= 0) return '0B';
-		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-		const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-		const val = bytes / Math.pow(1024, i);
-		return `${val.toFixed(val >= 10 ? 0 : 1)}${units[i]}`;
-	}
+  function getBytes(value: unknown): number {
+    if (typeof value === "number") return value;
+    if (value && typeof value === "object") {
+      const v = value as Record<string, unknown>;
+      if (typeof v.inBytes === "number") return v.inBytes;
+    }
+    return 0;
+  }
 
-	function formatEta(ms: number): string {
-		if (!ms || ms <= 0) return '--';
-		const totalSeconds = Math.round(ms / 1000);
-		const s = totalSeconds % 60;
-		const m = Math.floor(totalSeconds / 60) % 60;
-		const h = Math.floor(totalSeconds / 3600);
-		if (h > 0) return `${h}h ${m}m`;
-		if (m > 0) return `${m}m ${s}s`;
-		return `${s}s`;
-	}
+  function formatBytes(bytes: number): string {
+    if (!bytes || bytes <= 0) return "0B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    const i = Math.min(
+      Math.floor(Math.log(bytes) / Math.log(1024)),
+      units.length - 1,
+    );
+    const val = bytes / Math.pow(1024, i);
+    return `${val.toFixed(val >= 10 ? 0 : 1)}${units[i]}`;
+  }
 
-	function formatSpeed(bytesPerSecond: number): string {
-		if (!bytesPerSecond || bytesPerSecond <= 0) return '--';
-		const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-		const i = Math.min(Math.floor(Math.log(bytesPerSecond) / Math.log(1024)), units.length - 1);
-		const val = bytesPerSecond / Math.pow(1024, i);
-		return `${val.toFixed(val >= 10 ? 0 : 1)}${units[i]}`;
-	}
+  function formatEta(ms: number): string {
+    if (!ms || ms <= 0) return "--";
+    const totalSeconds = Math.round(ms / 1000);
+    const s = totalSeconds % 60;
+    const m = Math.floor(totalSeconds / 60) % 60;
+    const h = Math.floor(totalSeconds / 3600);
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
 
-	function clampPercent(value: number | undefined): number {
-		if (!Number.isFinite(value)) return 0;
-		return Math.min(100, Math.max(0, value as number));
-	}
+  function formatSpeed(bytesPerSecond: number): string {
+    if (!bytesPerSecond || bytesPerSecond <= 0) return "--";
+    const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+    const i = Math.min(
+      Math.floor(Math.log(bytesPerSecond) / Math.log(1024)),
+      units.length - 1,
+    );
+    const val = bytesPerSecond / Math.pow(1024, i);
+    return `${val.toFixed(val >= 10 ? 0 : 1)}${units[i]}`;
+  }
 
-	function extractModelIdFromDownload(downloadPayload: Record<string, unknown>): string | null {
-		const shardMetadata = downloadPayload.shard_metadata ?? downloadPayload.shardMetadata;
-		if (!shardMetadata || typeof shardMetadata !== 'object') return null;
+  function clampPercent(value: number | undefined): number {
+    if (!Number.isFinite(value)) return 0;
+    return Math.min(100, Math.max(0, value as number));
+  }
 
-		const shardObj = shardMetadata as Record<string, unknown>;
-		const shardKeys = Object.keys(shardObj);
-		if (shardKeys.length !== 1) return null;
+  const CELL_PRIORITY: Record<CellStatus["kind"], number> = {
+    completed: 4,
+    downloading: 3,
+    pending: 2,
+    failed: 1,
+    not_present: 0,
+  };
 
-		const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
-		if (!shardData) return null;
+  function shouldUpgradeCell(
+    existing: CellStatus,
+    candidate: CellStatus,
+  ): boolean {
+    return CELL_PRIORITY[candidate.kind] > CELL_PRIORITY[existing.kind];
+  }
 
-		const modelMeta = shardData.model_meta ?? shardData.modelMeta;
-		if (!modelMeta || typeof modelMeta !== 'object') return null;
+  function extractModelCard(payload: Record<string, unknown>): {
+    prettyName: string | null;
+    card: ModelCardInfo | null;
+  } {
+    const shardMetadata = payload.shard_metadata ?? payload.shardMetadata;
+    if (!shardMetadata || typeof shardMetadata !== "object")
+      return { prettyName: null, card: null };
+    const shardObj = shardMetadata as Record<string, unknown>;
+    const shardKeys = Object.keys(shardObj);
+    if (shardKeys.length !== 1) return { prettyName: null, card: null };
+    const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
+    const modelMeta = shardData?.model_card ?? shardData?.modelCard;
+    if (!modelMeta || typeof modelMeta !== "object")
+      return { prettyName: null, card: null };
+    const meta = modelMeta as Record<string, unknown>;
 
-		const meta = modelMeta as Record<string, unknown>;
-		return (meta.model_id as string) ?? (meta.modelId as string) ?? null;
-	}
+    const prettyName = (meta.prettyName as string) ?? null;
 
-	function parseDownloadProgress(payload: Record<string, unknown>): DownloadProgress | null {
-		const progress = payload.download_progress ?? payload.downloadProgress;
-		if (!progress || typeof progress !== 'object') return null;
+    const card: ModelCardInfo = {
+      family: (meta.family as string) ?? "",
+      quantization: (meta.quantization as string) ?? "",
+      baseModel:
+        (meta.base_model as string) ?? (meta.baseModel as string) ?? "",
+      capabilities: Array.isArray(meta.capabilities)
+        ? (meta.capabilities as string[])
+        : [],
+      storageSize: getBytes(meta.storage_size ?? meta.storageSize),
+      nLayers: (meta.n_layers as number) ?? (meta.nLayers as number) ?? 0,
+      supportsTensor:
+        (meta.supports_tensor as boolean) ??
+        (meta.supportsTensor as boolean) ??
+        false,
+    };
 
-		const prog = progress as Record<string, unknown>;
-		const totalBytes = getBytes(prog.total_bytes ?? prog.totalBytes);
-		const downloadedBytes = getBytes(prog.downloaded_bytes ?? prog.downloadedBytes);
-		const speed = (prog.speed as number) ?? 0;
-		const completedFiles = (prog.completed_files as number) ?? (prog.completedFiles as number) ?? 0;
-		const totalFiles = (prog.total_files as number) ?? (prog.totalFiles as number) ?? 0;
-		const etaMs = (prog.eta_ms as number) ?? (prog.etaMs as number) ?? 0;
+    return { prettyName, card };
+  }
 
-		const files: DownloadProgress['files'] = [];
-		const filesObj = (prog.files ?? {}) as Record<string, unknown>;
-		for (const [fileName, fileData] of Object.entries(filesObj)) {
-			if (!fileData || typeof fileData !== 'object') continue;
-			const fd = fileData as Record<string, unknown>;
-			const fTotal = getBytes(fd.total_bytes ?? fd.totalBytes);
-			const fDownloaded = getBytes(fd.downloaded_bytes ?? fd.downloadedBytes);
-			files.push({
-				name: fileName,
-				totalBytes: fTotal,
-				downloadedBytes: fDownloaded,
-				speed: (fd.speed as number) ?? 0,
-				etaMs: (fd.eta_ms as number) ?? (fd.etaMs as number) ?? 0,
-				percentage: fTotal > 0 ? (fDownloaded / fTotal) * 100 : 0
-			});
-		}
+  let modelRows = $state<ModelRow[]>([]);
+  let nodeColumns = $state<NodeColumn[]>([]);
+  let infoRow = $state<ModelRow | null>(null);
 
-		return {
-			totalBytes,
-			downloadedBytes,
-			speed,
-			etaMs: etaMs || (speed > 0 ? ((totalBytes - downloadedBytes) / speed) * 1000 : 0),
-			percentage: totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0,
-			completedFiles,
-			totalFiles,
-			files
-		};
-	}
+  $effect(() => {
+    try {
+      if (!downloadsData || Object.keys(downloadsData).length === 0) {
+        modelRows = [];
+        nodeColumns = [];
+        return;
+      }
 
-	function getBarGradient(percentage: number): string {
-		if (percentage >= 100) return 'from-green-500 to-green-400';
-		if (percentage <= 0) return 'from-red-500 to-red-400';
-		return 'from-exo-yellow to-exo-yellow/70';
-	}
+      const allNodeIds = Object.keys(downloadsData);
+      const columns: NodeColumn[] = allNodeIds.map((nodeId) => {
+        const diskInfo = nodeDiskData?.[nodeId];
+        return {
+          nodeId,
+          label: getNodeLabel(nodeId),
+          diskAvailable: diskInfo?.available?.inBytes,
+          diskTotal: diskInfo?.total?.inBytes,
+        };
+      });
 
-	let downloadOverview = $state<NodeEntry[]>([]);
+      const rowMap = new Map<string, ModelRow>();
 
-	$effect(() => {
-		try {
-			if (!downloadsData || Object.keys(downloadsData).length === 0) {
-				downloadOverview = [];
-				return;
-			}
+      for (const [nodeId, nodeDownloads] of Object.entries(downloadsData)) {
+        const entries = Array.isArray(nodeDownloads)
+          ? nodeDownloads
+          : nodeDownloads && typeof nodeDownloads === "object"
+            ? Object.values(nodeDownloads as Record<string, unknown>)
+            : [];
 
-			const entries = Object.entries(downloadsData);
-			const built: NodeEntry[] = [];
+        for (const entry of entries) {
+          const tagged = getDownloadTag(entry);
+          if (!tagged) continue;
+          const [tag, payload] = tagged;
 
-			for (const [nodeId, nodeDownloads] of entries) {
-				const modelMap = new Map<string, ModelEntry>();
-				const nodeEntries = Array.isArray(nodeDownloads)
-					? nodeDownloads
-					: nodeDownloads && typeof nodeDownloads === 'object'
-						? Object.values(nodeDownloads as Record<string, unknown>)
-						: [];
+          const modelId =
+            extractModelIdFromDownload(payload) ?? "unknown-model";
+          const { prettyName, card } = extractModelCard(payload);
 
-				for (const downloadWrapped of nodeEntries) {
-					if (!downloadWrapped || typeof downloadWrapped !== 'object') continue;
+          if (!rowMap.has(modelId)) {
+            rowMap.set(modelId, {
+              modelId,
+              prettyName,
+              cells: {},
+              shardMetadata: extractShardMetadata(payload),
+              modelCard: card,
+            });
+          }
+          const row = rowMap.get(modelId)!;
+          if (prettyName && !row.prettyName) row.prettyName = prettyName;
+          if (!row.shardMetadata)
+            row.shardMetadata = extractShardMetadata(payload);
+          if (!row.modelCard && card) row.modelCard = card;
 
-					const keys = Object.keys(downloadWrapped as Record<string, unknown>);
-					if (keys.length !== 1) continue;
+          const modelDirectory =
+            ((payload.model_directory ?? payload.modelDirectory) as string) ||
+            undefined;
+          let cell: CellStatus;
+          if (tag === "DownloadCompleted") {
+            const totalBytes = getBytes(payload.total);
+            cell = { kind: "completed", totalBytes, modelDirectory };
+          } else if (tag === "DownloadOngoing") {
+            const rawProgress =
+              payload.download_progress ?? payload.downloadProgress ?? {};
+            const prog = rawProgress as Record<string, unknown>;
+            const totalBytes = getBytes(prog.total ?? payload.total);
+            const downloadedBytes = getBytes(prog.downloaded);
+            const speed = (prog.speed as number) ?? 0;
+            const etaMs =
+              (prog.eta_ms as number) ?? (prog.etaMs as number) ?? 0;
+            const percentage =
+              totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0;
+            cell = {
+              kind: "downloading",
+              percentage: clampPercent(percentage),
+              downloadedBytes,
+              totalBytes,
+              speed,
+              etaMs,
+              modelDirectory,
+            };
+          } else if (tag === "DownloadFailed") {
+            cell = { kind: "failed", modelDirectory };
+          } else {
+            const downloaded = getBytes(
+              payload.downloaded ??
+                payload.downloaded_bytes ??
+                payload.downloadedBytes,
+            );
+            const total = getBytes(
+              payload.total ?? payload.total_bytes ?? payload.totalBytes,
+            );
+            cell = {
+              kind: "pending",
+              downloaded,
+              total,
+              modelDirectory,
+            };
+          }
 
-					const downloadKind = keys[0];
-					const downloadPayload = (downloadWrapped as Record<string, unknown>)[downloadKind] as Record<string, unknown>;
-					if (!downloadPayload) continue;
+          const existing = row.cells[nodeId];
+          if (!existing || shouldUpgradeCell(existing, cell)) {
+            row.cells[nodeId] = cell;
+          }
+        }
+      }
 
-					const modelId = extractModelIdFromDownload(downloadPayload) ?? 'unknown-model';
-					const prettyName = (() => {
-						const shardMetadata = downloadPayload.shard_metadata ?? downloadPayload.shardMetadata;
-						if (!shardMetadata || typeof shardMetadata !== 'object') return null;
-						const shardObj = shardMetadata as Record<string, unknown>;
-						const shardKeys = Object.keys(shardObj);
-						if (shardKeys.length !== 1) return null;
-						const shardData = shardObj[shardKeys[0]] as Record<string, unknown>;
-						const modelMeta = shardData?.model_meta ?? shardData?.modelMeta;
-						if (!modelMeta || typeof modelMeta !== 'object') return null;
-						const meta = modelMeta as Record<string, unknown>;
-						return (meta.prettyName as string) ?? null;
-					})();
+      function rowSortKey(row: ModelRow): number {
+        // in progress (4) -> completed (3) -> paused (2) -> not started (1) -> not present (0)
+        let best = 0;
+        for (const cell of Object.values(row.cells)) {
+          let score = 0;
+          if (cell.kind === "downloading") score = 4;
+          else if (cell.kind === "completed") score = 3;
+          else if (cell.kind === "pending" && cell.downloaded > 0)
+            score = 2; // paused
+          else if (cell.kind === "pending" || cell.kind === "failed") score = 1; // not started
+          if (score > best) best = score;
+        }
+        return best;
+      }
 
-					const rawProgress = (downloadPayload as Record<string, unknown>).download_progress
-						?? (downloadPayload as Record<string, unknown>).downloadProgress
-						?? {};
-					const totalBytes = getBytes((rawProgress as Record<string, unknown>).total_bytes ?? (rawProgress as Record<string, unknown>).totalBytes);
-					const downloadedBytes = getBytes((rawProgress as Record<string, unknown>).downloaded_bytes ?? (rawProgress as Record<string, unknown>).downloadedBytes);
-					const speed = (rawProgress as Record<string, unknown>).speed as number ?? 0;
-					const etaMs = (rawProgress as Record<string, unknown>).eta_ms as number ?? (rawProgress as Record<string, unknown>).etaMs as number ?? 0;
-					const percentage = totalBytes > 0 ? (downloadedBytes / totalBytes) * 100 : 0;
+      function totalCompletedBytes(row: ModelRow): number {
+        let total = 0;
+        for (const cell of Object.values(row.cells)) {
+          if (cell.kind === "completed") total += cell.totalBytes;
+        }
+        return total;
+      }
 
-					const files: FileProgress[] = [];
-					const filesObj = (rawProgress as Record<string, unknown>).files as Record<string, unknown> | undefined;
-					if (filesObj && typeof filesObj === 'object') {
-						for (const [fileName, fileData] of Object.entries(filesObj)) {
-							if (!fileData || typeof fileData !== 'object') continue;
-							const fd = fileData as Record<string, unknown>;
-							const fTotal = getBytes(fd.total_bytes ?? fd.totalBytes);
-							const fDownloaded = getBytes(fd.downloaded_bytes ?? fd.downloadedBytes);
-							files.push({
-								name: fileName,
-								totalBytes: fTotal,
-								downloadedBytes: fDownloaded,
-								speed: (fd.speed as number) ?? 0,
-								etaMs: (fd.eta_ms as number) ?? (fd.etaMs as number) ?? 0,
-								percentage: clampPercent(fTotal > 0 ? (fDownloaded / fTotal) * 100 : 0)
-							});
-						}
-					}
+      const rows = Array.from(rowMap.values()).sort((a, b) => {
+        const aPriority = rowSortKey(a);
+        const bPriority = rowSortKey(b);
+        if (aPriority !== bPriority) return bPriority - aPriority;
+        // Within completed or paused, sort by biggest size first
+        if (aPriority === 3 && bPriority === 3) {
+          const sizeDiff = totalCompletedBytes(b) - totalCompletedBytes(a);
+          if (sizeDiff !== 0) return sizeDiff;
+        }
+        if (aPriority === 2 && bPriority === 2) {
+          const aSize = Math.max(
+            ...Object.values(a.cells).map((c) =>
+              c.kind === "pending" ? c.total : 0,
+            ),
+          );
+          const bSize = Math.max(
+            ...Object.values(b.cells).map((c) =>
+              c.kind === "pending" ? c.total : 0,
+            ),
+          );
+          if (aSize !== bSize) return bSize - aSize;
+        }
+        return a.modelId.localeCompare(b.modelId);
+      });
 
-					const entry: ModelEntry = {
-						modelId,
-						prettyName,
-						percentage: downloadKind === 'DownloadCompleted' ? 100 : clampPercent(percentage),
-						downloadedBytes,
-						totalBytes,
-						speed,
-						etaMs,
-						status: downloadKind === 'DownloadCompleted' ? 'completed' : 'downloading',
-						files
-					};
+      modelRows = rows;
+      nodeColumns = columns;
+    } catch (err) {
+      console.error("Parse downloads error", err);
+      modelRows = [];
+      nodeColumns = [];
+    }
+  });
 
-					const existing = modelMap.get(modelId);
-					if (!existing) {
-						modelMap.set(modelId, entry);
-					} else if (
-						(entry.status === 'completed' && existing.status !== 'completed') ||
-						(entry.status === existing.status && entry.downloadedBytes > existing.downloadedBytes)
-					) {
-						modelMap.set(modelId, entry);
-					}
-				}
+  const hasDownloads = $derived(modelRows.length > 0);
+  const lastUpdateTs = $derived(lastUpdateStore());
+  const downloadKeys = $derived(Object.keys(downloadsData || {}));
 
-				let models = Array.from(modelMap.values()).sort((a, b) => b.percentage - a.percentage);
-				if (models.length === 0 && nodeEntries.length > 0) {
-					models = [{
-						modelId: 'Unknown download',
-						percentage: 0,
-						downloadedBytes: 0,
-						totalBytes: 0,
-						speed: 0,
-						etaMs: 0,
-						status: 'downloading',
-						files: []
-					}];
-				}
-
-				built.push({
-					nodeId,
-					nodeName: getNodeLabel(nodeId),
-					models
-				});
-			}
-
-			downloadOverview = built;
-		} catch (err) {
-			console.error('Parse downloads error', err);
-			downloadOverview = [];
-		}
-	});
-
-	const hasDownloads = $derived(downloadOverview.length > 0);
-	const lastUpdateTs = $derived(lastUpdateStore());
-	const downloadKeys = $derived(Object.keys(downloadsData || {}));
-
-	let expanded = $state<Set<string>>(new Set());
-	function toggleExpand(key: string): void {
-		const next = new Set(expanded);
-		if (next.has(key)) next.delete(key);
-		else next.add(key);
-		expanded = next;
-	}
-
-	onMount(() => {
-		// Ensure we fetch at least once when visiting downloads directly
-		refreshState();
-	});
+  onMount(() => {
+    refreshState();
+  });
 </script>
 
+{#snippet trashIcon()}
+  <svg
+    class="w-5 h-5"
+    viewBox="0 0 20 20"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+  >
+    <path
+      d="M4 6h12M8 6V4h4v2m1 0v10a1 1 0 01-1 1H8a1 1 0 01-1-1V6h6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    ></path>
+  </svg>
+{/snippet}
+
+{#snippet downloadIcon(size?: string)}
+  <svg
+    class={size ?? "w-5 h-5"}
+    viewBox="0 0 20 20"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="2"
+  >
+    <path
+      d="M10 3v10m0 0l-3-3m3 3l3-3M3 17h14"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    ></path>
+  </svg>
+{/snippet}
+
+{#snippet pauseIcon()}
+  <svg class="w-5 h-5" viewBox="0 0 20 20" fill="currentColor">
+    <path
+      fill-rule="evenodd"
+      d="M6 4h2v12H6V4zm6 0h2v12h-2V4z"
+      clip-rule="evenodd"
+    ></path>
+  </svg>
+{/snippet}
+
+{#snippet deleteButton(nodeId: string, modelId: string)}
+  <button
+    type="button"
+    class="text-white/50 hover:text-red-400 transition-colors cursor-pointer"
+    onclick={() => deleteDownload(nodeId, modelId)}
+    title="Delete from this node"
+  >
+    {@render trashIcon()}
+  </button>
+{/snippet}
+
 <div class="min-h-screen bg-exo-dark-gray text-white">
-	<HeaderNav showHome={true} />
-	<div class="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-6">
-		<div class="flex items-center justify-between gap-4 flex-wrap">
-			<div>
-				<h1 class="text-2xl font-mono tracking-[0.2em] uppercase text-exo-yellow">Downloads</h1>
-				<p class="text-sm text-exo-light-gray">Overview of models on each node</p>
-			</div>
-			<div class="flex items-center gap-3">
-				<button
-					type="button"
-					class="text-xs font-mono text-exo-light-gray hover:text-exo-yellow transition-colors uppercase border border-exo-medium-gray/40 px-2 py-1 rounded"
-					onclick={() => refreshState()}
-					title="Force refresh from /state"
-				>
-					Refresh
-				</button>
-				<div class="text-[11px] font-mono text-exo-light-gray">
-					Last update: {lastUpdateTs ? new Date(lastUpdateTs).toLocaleTimeString() : 'n/a'}
-				</div>
-			</div>
-		</div>
+  <HeaderNav showHome={true} />
+  <div class="max-w-7xl mx-auto px-4 lg:px-8 py-6 space-y-6">
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+      <div>
+        <h1
+          class="text-2xl font-mono tracking-[0.2em] uppercase text-exo-yellow"
+        >
+          Downloads
+        </h1>
+        <p class="text-sm text-exo-light-gray">
+          Overview of models on each node
+        </p>
+      </div>
+      <div class="flex items-center gap-3">
+        <button
+          type="button"
+          class="text-xs font-mono text-exo-light-gray hover:text-exo-yellow transition-colors uppercase border border-exo-medium-gray/40 px-2 py-1 rounded"
+          onclick={() => refreshState()}
+          title="Force refresh from /state"
+        >
+          Refresh
+        </button>
+        <div class="text-[11px] font-mono text-exo-light-gray">
+          Last update: {lastUpdateTs
+            ? new Date(lastUpdateTs).toLocaleTimeString()
+            : "n/a"}
+        </div>
+      </div>
+    </div>
 
-		{#if !hasDownloads}
-			<div class="rounded border border-exo-medium-gray/30 bg-exo-black/30 p-6 text-center text-exo-light-gray space-y-2">
-				<div class="text-sm">No downloads found. Start a model download to see progress here.</div>
-				<div class="text-[11px] text-exo-light-gray/70">
-					Download keys detected: {downloadKeys.length === 0 ? 'none' : downloadKeys.join(', ')}
-				</div>
-			</div>
-		{:else}
-			<div class="downloads-grid gap-4">
-				{#each downloadOverview as node}
-					<div class="rounded border border-exo-medium-gray/30 bg-exo-black/30 p-4 space-y-3 flex flex-col">
-						<div class="flex items-center justify-between gap-3">
-							<div class="min-w-0 flex-1">
-								<div class="text-lg font-mono text-white truncate">{node.nodeName}</div>
-								<div class="text-xs text-exo-light-gray font-mono truncate">{node.nodeId}</div>
-							</div>
-							<div class="text-xs font-mono uppercase tracking-wider whitespace-nowrap shrink-0">
-								<span class="text-green-400">{node.models.filter(m => m.status === 'completed').length}</span><span class="text-exo-yellow"> /{node.models.length} models</span>
-							</div>
-						</div>
+    {#if !hasDownloads}
+      <div
+        class="rounded border border-exo-medium-gray/30 bg-exo-black/30 p-6 text-center text-exo-light-gray space-y-2"
+      >
+        <div class="text-sm">
+          No downloads found. Start a model download to see progress here.
+        </div>
+        <div class="text-[11px] text-exo-light-gray/70">
+          Download keys detected: {downloadKeys.length === 0
+            ? "none"
+            : downloadKeys.join(", ")}
+        </div>
+      </div>
+    {:else}
+      <div
+        class="rounded border border-exo-medium-gray/30 bg-exo-black/30 overflow-x-auto"
+      >
+        <table class="w-full text-left font-mono text-xs">
+          <thead>
+            <tr class="border-b border-exo-medium-gray/30">
+              <th
+                class="sticky left-0 z-10 bg-exo-black px-4 py-3 text-[11px] uppercase tracking-wider text-exo-yellow font-medium whitespace-nowrap border-r border-exo-medium-gray/20"
+              >
+                Model
+              </th>
+              {#each nodeColumns as col}
+                <th
+                  class="px-4 py-3 text-[11px] uppercase tracking-wider text-exo-light-gray font-medium text-center whitespace-nowrap min-w-[120px]"
+                >
+                  <div>{col.label}</div>
+                  {#if col.diskAvailable != null}
+                    <div
+                      class="text-[9px] text-white/70 normal-case tracking-normal mt-0.5"
+                    >
+                      {formatBytes(col.diskAvailable)} free
+                    </div>
+                  {/if}
+                </th>
+              {/each}
+            </tr>
+          </thead>
+          <tbody>
+            {#each modelRows as row}
+              <tr
+                class="group border-b border-exo-medium-gray/20 hover:bg-exo-medium-gray/10 transition-colors"
+              >
+                <td
+                  class="sticky left-0 z-10 bg-exo-dark-gray group-hover:bg-[oklch(0.18_0_0)] transition-colors px-4 py-3 whitespace-nowrap border-r border-exo-medium-gray/20"
+                >
+                  <div class="flex items-center gap-2">
+                    <div class="min-w-0">
+                      <div class="text-white text-xs" title={row.modelId}>
+                        {row.prettyName ?? row.modelId}
+                      </div>
+                      {#if row.prettyName}
+                        <div
+                          class="text-[10px] text-white/60"
+                          title={row.modelId}
+                        >
+                          {row.modelId}
+                        </div>
+                      {/if}
+                    </div>
+                    <button
+                      type="button"
+                      class="p-1 rounded hover:bg-white/10 transition-colors flex-shrink-0 opacity-60 group-hover:opacity-100"
+                      onclick={() => (infoRow = row)}
+                      title="View model details"
+                    >
+                      <svg
+                        class="w-4 h-4 text-white/60 hover:text-white/80"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                      >
+                        <path
+                          d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                </td>
 
-						{#each node.models as model}
-							{@const key = `${node.nodeId}|${model.modelId}`}
-							{@const pct = clampPercent(model.percentage)}
-							{@const gradient = getBarGradient(pct)}
-							{@const isExpanded = expanded.has(key)}
-							<div class="rounded border border-exo-medium-gray/30 bg-exo-dark-gray/60 p-3 space-y-2">
-								<div class="flex items-center justify-between gap-3">
-									<div class="min-w-0 space-y-0.5">
-										<div class="text-sm font-mono text-white truncate">{model.prettyName ?? model.modelId}</div>
-										<div class="text-[11px] text-exo-light-gray font-mono truncate">
-											{model.modelId}
-										</div>
-										<div class="text-[11px] text-exo-light-gray font-mono">
-											{formatBytes(model.downloadedBytes)} / {formatBytes(model.totalBytes)}
-										</div>
-									</div>
-									<div class="flex items-center gap-2">
-										<span class="text-xs font-mono {pct >= 100 ? 'text-green-400' : pct <= 0 ? 'text-red-400' : 'text-exo-yellow'}">
-											{pct.toFixed(1)}%
-										</span>
-										<button
-											type="button"
-											class="text-exo-light-gray hover:text-exo-yellow transition-colors"
-											onclick={() => toggleExpand(key)}
-											aria-expanded={isExpanded}
-											title="Toggle file details"
-										>
-											<svg class="w-4 h-4" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2">
-												<path d="M6 8l4 4 4-4" class={isExpanded ? 'transform rotate-180 origin-center transition-transform duration-150' : 'transition-transform duration-150'}></path>
-											</svg>
-										</button>
-									</div>
-								</div>
-
-								<div class="relative h-2 bg-exo-black/60 rounded-sm overflow-hidden">
-									<div
-										class={`absolute inset-y-0 left-0 bg-gradient-to-r ${gradient} transition-all duration-300`}
-										style={`width: ${pct.toFixed(1)}%`}
-									></div>
-								</div>
-
-								<div class="flex items-center justify-between text-xs font-mono text-exo-light-gray">
-									<span>{model.status === 'completed' ? 'Completed' : `${formatSpeed(model.speed)} • ETA ${formatEta(model.etaMs)}`}</span>
-									{#if model.status !== 'completed'}
-										<span>{model.files.length} file{model.files.length === 1 ? '' : 's'}</span>
-									{/if}
-								</div>
-
-								{#if isExpanded}
-									<div class="mt-2 space-y-1.5">
-										{#if model.files.length === 0}
-											<div class="text-[11px] font-mono text-exo-light-gray/70">No file details reported.</div>
-										{:else}
-											{#each model.files as f}
-												{@const fpct = clampPercent(f.percentage)}
-												{@const fgradient = getBarGradient(fpct)}
-												<div class="rounded border border-exo-medium-gray/20 bg-exo-black/40 p-2 space-y-1">
-													<div class="flex items-center justify-between text-[11px] font-mono text-exo-light-gray/90">
-														<span class="truncate pr-2">{f.name}</span>
-														<span class="{fpct >= 100 ? 'text-green-400' : fpct <= 0 ? 'text-red-400' : 'text-exo-yellow'}">{fpct.toFixed(1)}%</span>
-													</div>
-													<div class="relative h-1.5 bg-exo-black/60 rounded-sm overflow-hidden">
-														<div
-															class={`absolute inset-y-0 left-0 bg-gradient-to-r ${fgradient} transition-all duration-300`}
-															style={`width: ${fpct.toFixed(1)}%`}
-														></div>
-													</div>
-													<div class="flex items-center justify-between text-[10px] text-exo-light-gray/70">
-														<span>{formatBytes(f.downloadedBytes)} / {formatBytes(f.totalBytes)}</span>
-														<span>{formatSpeed(f.speed)} • ETA {formatEta(f.etaMs)}</span>
-													</div>
-												</div>
-											{/each}
-										{/if}
-									</div>
-								{/if}
-							</div>
-						{/each}
-					</div>
-				{/each}
-			</div>
-		{/if}
-
-	</div>
+                {#each nodeColumns as col}
+                  {@const cell = row.cells[col.nodeId] ?? {
+                    kind: "not_present" as const,
+                  }}
+                  <td class="px-4 py-3 text-center align-middle">
+                    {#if cell.kind === "completed"}
+                      <div
+                        class="flex flex-col items-center gap-1"
+                        title="Completed ({formatBytes(cell.totalBytes)})"
+                      >
+                        <svg
+                          class="w-7 h-7 text-green-400"
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                        >
+                          <path
+                            fill-rule="evenodd"
+                            d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"
+                            clip-rule="evenodd"
+                          ></path>
+                        </svg>
+                        <span class="text-xs text-white/70"
+                          >{formatBytes(cell.totalBytes)}</span
+                        >
+                        {@render deleteButton(col.nodeId, row.modelId)}
+                      </div>
+                    {:else if cell.kind === "downloading"}
+                      <div
+                        class="flex flex-col items-center gap-1"
+                        title="{formatBytes(
+                          cell.downloadedBytes,
+                        )} / {formatBytes(cell.totalBytes)} - {formatSpeed(
+                          cell.speed,
+                        )} - ETA {formatEta(cell.etaMs)}"
+                      >
+                        <span class="text-exo-yellow text-sm font-medium"
+                          >{clampPercent(cell.percentage).toFixed(1)}%</span
+                        >
+                        <div
+                          class="w-16 h-2 bg-exo-black/60 rounded-sm overflow-hidden"
+                        >
+                          <div
+                            class="h-full bg-gradient-to-r from-exo-yellow to-exo-yellow/70 transition-all duration-300"
+                            style="width: {clampPercent(
+                              cell.percentage,
+                            ).toFixed(1)}%"
+                          ></div>
+                        </div>
+                        <span class="text-[10px] text-white/70"
+                          >{formatSpeed(cell.speed)}</span
+                        >
+                        <div class="flex gap-1 mt-0.5">
+                          <button
+                            type="button"
+                            class="text-white/50 hover:text-exo-yellow transition-colors cursor-pointer"
+                            onclick={() =>
+                              cancelDownload(col.nodeId, row.modelId)}
+                            title="Pause download"
+                          >
+                            {@render pauseIcon()}
+                          </button>
+                          {@render deleteButton(col.nodeId, row.modelId)}
+                        </div>
+                      </div>
+                    {:else if cell.kind === "pending"}
+                      <div
+                        class="flex flex-col items-center gap-1"
+                        title={cell.downloaded > 0
+                          ? `${formatBytes(cell.downloaded)} / ${formatBytes(cell.total)} downloaded (paused)`
+                          : "Download pending"}
+                      >
+                        {#if cell.downloaded > 0 && cell.total > 0}
+                          <span class="text-white/70 text-xs"
+                            >{formatBytes(cell.downloaded)} / {formatBytes(
+                              cell.total,
+                            )}</span
+                          >
+                          <div
+                            class="w-full h-1.5 bg-white/10 rounded-full overflow-hidden"
+                          >
+                            <div
+                              class="h-full bg-exo-light-gray/40 rounded-full"
+                              style="width: {(
+                                (cell.downloaded / cell.total) *
+                                100
+                              ).toFixed(1)}%"
+                            ></div>
+                          </div>
+                          <div class="flex gap-1">
+                            {#if row.shardMetadata}
+                              <button
+                                type="button"
+                                class="text-white/50 hover:text-exo-yellow transition-colors cursor-pointer"
+                                onclick={() =>
+                                  startDownload(col.nodeId, row.shardMetadata!)}
+                                title="Resume download on this node"
+                              >
+                                {@render downloadIcon()}
+                              </button>
+                            {:else}
+                              <span class="text-white/50 text-[10px]"
+                                >paused</span
+                              >
+                            {/if}
+                            {@render deleteButton(col.nodeId, row.modelId)}
+                          </div>
+                        {:else if row.shardMetadata}
+                          <button
+                            type="button"
+                            class="text-white/50 hover:text-exo-yellow transition-colors cursor-pointer"
+                            onclick={() =>
+                              startDownload(col.nodeId, row.shardMetadata!)}
+                            title="Start download on this node"
+                          >
+                            {@render downloadIcon("w-6 h-6")}
+                          </button>
+                        {:else}
+                          <span class="text-white/40 text-sm">...</span>
+                        {/if}
+                      </div>
+                    {:else if cell.kind === "failed"}
+                      <div
+                        class="flex flex-col items-center gap-1"
+                        title="Download failed"
+                      >
+                        <svg
+                          class="w-7 h-7 text-red-400"
+                          viewBox="0 0 20 20"
+                          fill="currentColor"
+                        >
+                          <path
+                            fill-rule="evenodd"
+                            d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z"
+                            clip-rule="evenodd"
+                          ></path>
+                        </svg>
+                        <div class="flex gap-1">
+                          {#if row.shardMetadata}
+                            <button
+                              type="button"
+                              class="text-white/50 hover:text-exo-yellow transition-colors cursor-pointer"
+                              onclick={() =>
+                                startDownload(col.nodeId, row.shardMetadata!)}
+                              title="Retry download on this node"
+                            >
+                              {@render downloadIcon()}
+                            </button>
+                          {/if}
+                          {@render deleteButton(col.nodeId, row.modelId)}
+                        </div>
+                      </div>
+                    {:else}
+                      <div
+                        class="flex flex-col items-center"
+                        title="Not on this node"
+                      >
+                        <span class="text-exo-medium-gray text-lg leading-none"
+                          >--</span
+                        >
+                        {#if row.shardMetadata}
+                          <button
+                            type="button"
+                            class="text-white/50 hover:text-exo-yellow transition-colors mt-0.5 opacity-0 group-hover:opacity-100 cursor-pointer"
+                            onclick={() =>
+                              startDownload(col.nodeId, row.shardMetadata!)}
+                            title="Download to this node"
+                          >
+                            {@render downloadIcon()}
+                          </button>
+                        {/if}
+                      </div>
+                    {/if}
+                  </td>
+                {/each}
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </div>
 </div>
 
+<!-- Info modal -->
+{#if infoRow}
+  <div
+    class="fixed inset-0 z-[60] bg-black/60"
+    transition:fade={{ duration: 150 }}
+    onclick={() => (infoRow = null)}
+    role="presentation"
+  ></div>
+  <div
+    class="fixed z-[60] top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[min(80vw,400px)] bg-exo-dark-gray border border-exo-yellow/10 rounded-lg shadow-2xl p-4"
+    transition:fly={{ y: 10, duration: 200, easing: cubicOut }}
+    role="dialog"
+    aria-modal="true"
+  >
+    <div class="flex items-start justify-between mb-3">
+      <h3 class="font-mono text-lg text-white">
+        {infoRow.prettyName ?? infoRow.modelId}
+      </h3>
+      <button
+        type="button"
+        class="p-1 rounded hover:bg-white/10 transition-colors text-white/50"
+        onclick={() => (infoRow = null)}
+        title="Close model details"
+        aria-label="Close info dialog"
+      >
+        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+          <path
+            d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"
+          />
+        </svg>
+      </button>
+    </div>
+    <div class="space-y-2 text-xs font-mono">
+      <div class="flex items-center gap-2">
+        <span class="text-white/40">Model ID:</span>
+        <span class="text-white/70">{infoRow.modelId}</span>
+      </div>
+      {#if infoRow.modelCard}
+        {#if infoRow.modelCard.family}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Family:</span>
+            <span class="text-white/70">{infoRow.modelCard.family}</span>
+          </div>
+        {/if}
+        {#if infoRow.modelCard.baseModel}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Base model:</span>
+            <span class="text-white/70">{infoRow.modelCard.baseModel}</span>
+          </div>
+        {/if}
+        {#if infoRow.modelCard.quantization}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Quantization:</span>
+            <span class="text-white/70">{infoRow.modelCard.quantization}</span>
+          </div>
+        {/if}
+        {#if infoRow.modelCard.storageSize > 0}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Size:</span>
+            <span class="text-white/70"
+              >{formatBytes(infoRow.modelCard.storageSize)}</span
+            >
+          </div>
+        {/if}
+        {#if infoRow.modelCard.nLayers > 0}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Layers:</span>
+            <span class="text-white/70">{infoRow.modelCard.nLayers}</span>
+          </div>
+        {/if}
+        {#if infoRow.modelCard.capabilities.length > 0}
+          <div class="flex items-center gap-2">
+            <span class="text-white/40">Capabilities:</span>
+            <span class="text-white/70"
+              >{infoRow.modelCard.capabilities.join(", ")}</span
+            >
+          </div>
+        {/if}
+        <div class="flex items-center gap-2">
+          <span class="text-white/40">Tensor parallelism:</span>
+          <span class="text-white/70"
+            >{infoRow.modelCard.supportsTensor ? "Yes" : "No"}</span
+          >
+        </div>
+      {/if}
+
+      <!-- Per-node download status -->
+      {#if nodeColumns.filter((col) => (infoRow?.cells[col.nodeId]?.kind ?? "not_present") !== "not_present").length > 0}
+        <div class="mt-3 pt-3 border-t border-exo-yellow/10">
+          <div class="flex items-center gap-2 mb-1">
+            <svg
+              class="w-3.5 h-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                class="text-white/40"
+                d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"
+              />
+              <path class="text-green-400" d="m9 13 2 2 4-4" />
+            </svg>
+            <span class="text-white/40">On nodes:</span>
+          </div>
+          <div class="flex flex-col gap-1.5 mt-1">
+            {#each nodeColumns as col}
+              {@const cellStatus = infoRow?.cells[col.nodeId]}
+              {#if cellStatus && cellStatus.kind !== "not_present"}
+                <div class="flex flex-col gap-0.5">
+                  <span
+                    class="inline-block w-fit px-1.5 py-0.5 rounded text-[10px] {cellStatus.kind ===
+                    'completed'
+                      ? 'bg-green-500/10 text-green-400/80 border border-green-500/20'
+                      : cellStatus.kind === 'downloading'
+                        ? 'bg-exo-yellow/10 text-exo-yellow/80 border border-exo-yellow/20'
+                        : cellStatus.kind === 'failed'
+                          ? 'bg-red-500/10 text-red-400/80 border border-red-500/20'
+                          : 'bg-white/5 text-white/50 border border-white/10'}"
+                  >
+                    {col.label}
+                    {#if cellStatus.kind === "downloading" && "percentage" in cellStatus}
+                      ({clampPercent(cellStatus.percentage).toFixed(0)}%)
+                    {/if}
+                  </span>
+                  {#if "modelDirectory" in cellStatus && cellStatus.modelDirectory}
+                    <span
+                      class="text-[9px] text-white/30 break-all pl-1"
+                      title={cellStatus.modelDirectory}
+                    >
+                      {cellStatus.modelDirectory}
+                    </span>
+                  {/if}
+                </div>
+              {/if}
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
 <style>
-	.downloads-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-	}
-	@media (min-width: 1024px) {
-		.downloads-grid {
-			grid-template-columns: repeat(3, minmax(0, 1fr));
-		}
-	}
-	@media (min-width: 1440px) {
-		.downloads-grid {
-			grid-template-columns: repeat(4, minmax(0, 1fr));
-		}
-	}
+  table {
+    min-width: max-content;
+  }
 </style>

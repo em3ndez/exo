@@ -2,10 +2,11 @@ from collections.abc import Mapping
 
 from pydantic import model_validator
 
+from exo.shared.models.model_cards import ModelId
 from exo.shared.types.common import Id, NodeId
-from exo.shared.types.models import ModelId
 from exo.shared.types.worker.shards import ShardMetadata
-from exo.utils.pydantic_ext import CamelCaseModel, TaggedModel
+from exo.utils.pydantic_ext import FrozenModel, TaggedModel
+from exo.worker.runner.diagnostics import KnownRunnerDiagnostic
 
 
 class RunnerId(Id):
@@ -21,12 +22,21 @@ class BaseRunnerStatus(TaggedModel):
         return isinstance(self, RunnerRunning)
 
 
-class RunnerWaitingForModel(BaseRunnerStatus):
+class RunnerIdle(BaseRunnerStatus):
+    pass
+
+
+class RunnerConnecting(BaseRunnerStatus):
+    pass
+
+
+class RunnerConnected(BaseRunnerStatus):
     pass
 
 
 class RunnerLoading(BaseRunnerStatus):
-    pass
+    layers_loaded: int = 0
+    total_layers: int = 0
 
 
 class RunnerLoaded(BaseRunnerStatus):
@@ -38,10 +48,14 @@ class RunnerWarmingUp(BaseRunnerStatus):
 
 
 class RunnerReady(BaseRunnerStatus):
-    pass
+    prefill_server_port: int | None = None
 
 
 class RunnerRunning(BaseRunnerStatus):
+    pass
+
+
+class RunnerShuttingDown(BaseRunnerStatus):
     pass
 
 
@@ -51,21 +65,25 @@ class RunnerShutdown(BaseRunnerStatus):
 
 class RunnerFailed(BaseRunnerStatus):
     error_message: str | None = None
+    diagnostics: list[KnownRunnerDiagnostic]
 
 
 RunnerStatus = (
-    RunnerWaitingForModel
+    RunnerIdle
+    | RunnerConnecting
+    | RunnerConnected
     | RunnerLoading
     | RunnerLoaded
     | RunnerWarmingUp
     | RunnerReady
     | RunnerRunning
+    | RunnerShuttingDown
     | RunnerShutdown
     | RunnerFailed
 )
 
 
-class ShardAssignments(CamelCaseModel):
+class ShardAssignments(FrozenModel):
     model_id: ModelId
     runner_to_shard: Mapping[RunnerId, ShardMetadata]
     node_to_runner: Mapping[NodeId, RunnerId]

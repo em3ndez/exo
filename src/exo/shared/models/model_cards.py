@@ -1,451 +1,393 @@
+import json
+from enum import Enum
+from typing import Annotated, Any
+
+import aiofiles
+import aiofiles.os as aios
+import tomlkit
+from anyio import Path, open_file
+from huggingface_hub import model_info
+from loguru import logger
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    Field,
+    PositiveInt,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
+from tomlkit.exceptions import TOMLKitError
+
+from exo.shared.constants import (
+    EXO_CUSTOM_MODEL_CARDS_DIR,
+    EXO_ENABLE_IMAGE_MODELS,
+    EXO_MODELS_DIRS,
+    RESOURCES_DIR,
+)
+from exo.shared.types.backends import Backend
+from exo.shared.types.common import ModelId
 from exo.shared.types.memory import Memory
-from exo.shared.types.models import ModelId, ModelMetadata
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.shared.types.text_generation import ReasoningDialect
+from exo.utils.pydantic_ext import FrozenModel
+
+# kinda ugly...
+# TODO: load search path from config.toml
+_custom_cards_dir = Path(str(EXO_CUSTOM_MODEL_CARDS_DIR))
+_BUILTIN_CARD_DIRS = [
+    Path(RESOURCES_DIR) / "inference_model_cards",
+    Path(RESOURCES_DIR) / "image_model_cards",
+]
 
 
-class ModelCard(CamelCaseModel):
-    short_id: str
+class _CardCache:
+    def __init__(self):
+        self.cc: dict[ModelId, "ModelCard"] = {}
+
+    def get(self, model_id: ModelId) -> "ModelCard | None":
+        return self.cc.get(model_id)
+
+    async def save(self, card: "ModelCard"):
+        self.cc[card.model_id] = card
+        try:
+            await card.save_to_custom_dir()
+        except OSError as e:
+            logger.warning(f"failed to save custom model card ({e.strerror})")
+
+    async def pop(self, model_id: ModelId) -> "ModelCard | None":
+        """Delete a user-added custom model card. Returns True if deleted."""
+        card_path = _custom_cards_dir / (ModelId(model_id).normalize() + ".toml")
+        try:
+            if await card_path.exists():
+                await card_path.unlink()
+                return self.cc.pop(model_id, None)
+        except OSError as e:
+            logger.warning(f"failed to delete custom model card ({e.strerror})")
+
+    async def list_all(self) -> list["ModelCard"]:
+        if len(self.cc) == 0:
+            await self.refresh()
+        if EXO_ENABLE_IMAGE_MODELS:
+            return list(self.cc.values())
+        return [c for c in self.cc.values() if not _is_image_card(c)]
+
+    async def _load_cards_from_dir(self, directory: Path, *, is_custom: bool) -> None:
+        """Load all TOML model cards from a directory into the cache."""
+        async for toml_file in directory.rglob("*.toml"):
+            try:
+                card = await ModelCard.load_from_path(toml_file)
+                if is_custom:
+                    card = card.model_copy(update={"is_custom": True})
+                if self.get(card.model_id) is None:
+                    self.cc[card.model_id] = card
+            except (ValidationError, TOMLKitError) as e:
+                logger.opt(exception=e).warning(
+                    f"failed to validate model card at {toml_file}"
+                )
+
+    async def refresh(self) -> None:
+        for path in _BUILTIN_CARD_DIRS:
+            await self._load_cards_from_dir(path, is_custom=False)
+        await self._load_cards_from_dir(_custom_cards_dir, is_custom=True)
+
+
+card_cache = _CardCache()
+
+
+def detect_vision_from_config(model_id: ModelId) -> "VisionCardConfig | None":
+    normalized = model_id.normalize()
+    for model_dir in [d / normalized for d in EXO_MODELS_DIRS]:
+        config_path = model_dir / "config.json"
+        if not config_path.exists():
+            continue
+        try:
+            with open(config_path) as f:
+                raw = json.load(f)  # type: ignore
+            return ConfigData.model_validate(
+                raw, context={"model_id": str(model_id)}
+            ).vision
+        except Exception:
+            continue
+    return None
+
+
+def _is_image_card(card: "ModelCard") -> bool:
+    return any(t in (ModelTask.TextToImage, ModelTask.ImageToImage) for t in card.tasks)
+
+
+class ModelTask(str, Enum):
+    TextGeneration = "TextGeneration"
+    TextToImage = "TextToImage"
+    ImageToImage = "ImageToImage"
+
+
+class ComponentInfo(FrozenModel):
+    component_name: str
+    component_path: str
+    storage_size: Memory
+    n_layers: PositiveInt | None = None
+    can_shard: bool
+    safetensors_index_filename: str | None = None
+
+
+class VisionCardConfig(FrozenModel):
+    image_token_id: int
+    model_type: str
+    weights_repo: str = ""
+    image_token: str | None = None
+    processor_repo: str | None = None
+
+
+class SamplingValues(FrozenModel):
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float | None = None
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+
+
+class SamplingDefaults(SamplingValues):
+    thinking: SamplingValues | None = None
+    non_thinking: SamplingValues | None = None
+
+
+class ModelCard(FrozenModel):
     model_id: ModelId
-    name: str
-    description: str
-    tags: list[str]
-    metadata: ModelMetadata
+    storage_size: Memory
+    n_layers: PositiveInt
+    hidden_size: PositiveInt
+    supports_tensor: bool
+    num_key_value_heads: PositiveInt | None = None
+    tasks: list[ModelTask]
+    components: list[ComponentInfo] | None = None
+    family: str = ""
+    quantization: str = ""
+    base_model: str = ""
+    capabilities: list[str] = []
+    backends: list[Backend]
+    reasoning_dialect: ReasoningDialect = "none"
+    context_length: int = 0
+    uses_cfg: bool = False
+    trust_remote_code: bool = True
+    is_custom: bool = False
+    vision: VisionCardConfig | None = None
+    sampling_defaults: SamplingDefaults = Field(default_factory=SamplingDefaults)
+
+    @model_validator(mode="after")
+    def _autodetect_vision(self) -> "ModelCard":
+        if self.vision is None:
+            detected = detect_vision_from_config(self.model_id)
+            if detected is not None:
+                object.__setattr__(self, "vision", detected)
+        return self
+
+    @model_validator(mode="after")
+    def _fill_vision_weights_repo(self) -> "ModelCard":
+        if self.vision is not None and not self.vision.weights_repo:
+            object.__setattr__(
+                self,
+                "vision",
+                self.vision.model_copy(update={"weights_repo": str(self.model_id)}),
+            )
+        return self
+
+    @field_validator("tasks", mode="before")
+    @classmethod
+    def _validate_tasks(cls, v: list[str | ModelTask]) -> list[ModelTask]:
+        return [item if isinstance(item, ModelTask) else ModelTask(item) for item in v]
+
+    @field_validator("backends", mode="before")
+    @classmethod
+    def _validate_backends(cls, v: list[str | Backend]) -> list[Backend]:
+        return [item if isinstance(item, Backend) else Backend(item) for item in v]
+
+    async def save(self, path: Path) -> None:
+        async with await open_file(path, "w") as f:
+            py = self.model_dump(exclude_none=True, exclude={"is_custom"})
+            data = tomlkit.dumps(py)  # pyright: ignore[reportUnknownMemberType]
+            await f.write(data)
+
+    async def save_to_custom_dir(self) -> None:
+        await aios.makedirs(str(_custom_cards_dir), exist_ok=True)
+        await self.save(_custom_cards_dir / (self.model_id.normalize() + ".toml"))
+
+    @staticmethod
+    async def load_from_path(path: Path) -> "ModelCard":
+        async with await open_file(path, "r") as f:
+            py = tomlkit.loads(await f.read())
+            return ModelCard.model_validate(py)
+
+    # Is it okay that model card.load defaults to network access if the card doesn't exist? do we want to be more explicit here?
+    @staticmethod
+    async def load(model_id: ModelId) -> "ModelCard":
+        if card_cache.get(model_id) is None:
+            await card_cache.refresh()
+        if (mc := card_cache.get(model_id)) is not None:
+            return mc
+
+        mc = await ModelCard.fetch_from_hf(model_id)
+        await mc.save_to_custom_dir()
+        return mc
+
+    @staticmethod
+    async def fetch_from_hf(model_id: ModelId) -> "ModelCard":
+        """Fetches storage size and number of layers for a Hugging Face model, returns Pydantic ModelMeta.
+
+        This is a pure fetch — it does NOT save to disk or update the cache.
+        Persistence is handled by the event-sourcing layer (worker event handler).
+        """
+        # TODO: failure if files do not exist
+        config_data = await fetch_config_data(model_id)
+        num_layers = config_data.layer_count
+        mem_size_bytes = await fetch_safetensors_size(model_id)
+
+        return ModelCard(
+            model_id=ModelId(model_id),
+            storage_size=mem_size_bytes,
+            n_layers=num_layers,
+            hidden_size=config_data.hidden_size or 0,
+            supports_tensor=config_data.supports_tensor,
+            num_key_value_heads=config_data.num_key_value_heads,
+            context_length=config_data.max_position_embeddings,
+            tasks=[ModelTask.TextGeneration],
+            trust_remote_code=False,
+            is_custom=True,
+            vision=config_data.vision,
+            backends=list(
+                Backend
+            ),  # all backends — we don't know what an arbitrary HF model supports; let placement gate decide
+        )
 
 
-MODEL_CARDS: dict[str, ModelCard] = {
-    # deepseek v3
-    # "deepseek-v3-0324:4bit": ModelCard(
-    #     short_id="deepseek-v3-0324:4bit",
-    #     model_id="mlx-community/DeepSeek-V3-0324-4bit",
-    #     name="DeepSeek V3 0324 (4-bit)",
-    #     description="""DeepSeek V3 is a large language model trained on the DeepSeek V3 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-V3-0324-4bit"),
-    #         pretty_name="DeepSeek V3 0324 (4-bit)",
-    #         storage_size=Memory.from_kb(409706307),
-    #         n_layers=61,
-    #     ),
-    # ),
-    # "deepseek-v3-0324": ModelCard(
-    #     short_id="deepseek-v3-0324",
-    #     model_id="mlx-community/DeepSeek-v3-0324-8bit",
-    #     name="DeepSeek V3 0324 (8-bit)",
-    #     description="""DeepSeek V3 is a large language model trained on the DeepSeek V3 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-v3-0324-8bit"),
-    #         pretty_name="DeepSeek V3 0324 (8-bit)",
-    #         storage_size=Memory.from_kb(754706307),
-    #         n_layers=61,
-    #     ),
-    # ),
-    "deepseek-v3.1-4bit": ModelCard(
-        short_id="deepseek-v3.1-4bit",
-        model_id=ModelId("mlx-community/DeepSeek-V3.1-4bit"),
-        name="DeepSeek V3.1 (4-bit)",
-        description="""DeepSeek V3.1 is a large language model trained on the DeepSeek V3.1 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/DeepSeek-V3.1-4bit"),
-            pretty_name="DeepSeek V3.1 (4-bit)",
-            storage_size=Memory.from_gb(378),
-            n_layers=61,
+class ConfigData(BaseModel):
+    model_config = {"extra": "ignore"}  # Allow unknown fields
+
+    architectures: list[str] | None = None
+    hidden_size: Annotated[int, Field(ge=0)] | None = None
+    num_key_value_heads: PositiveInt | None = None
+    layer_count: int = Field(
+        validation_alias=AliasChoices(
+            "num_hidden_layers",
+            "num_layers",
+            "n_layer",
+            "n_layers",
+            "num_decoder_layers",
+            "decoder_layers",
+        )
+    )
+    max_position_embeddings: int = 0
+    vision: VisionCardConfig | None = None
+
+    @property
+    def supports_tensor(self) -> bool:
+        return self.architectures in [
+            ["Glm4MoeLiteForCausalLM"],
+            ["GlmMoeDsaForCausalLM"],
+            ["DeepseekV4ForCausalLM"],
+            ["DeepseekV32ForCausalLM"],
+            ["DeepseekV3ForCausalLM"],
+            ["Qwen3NextForCausalLM"],
+            ["Qwen3MoeForCausalLM"],
+            ["Qwen3_5MoeForConditionalGeneration"],
+            ["Qwen3_5ForConditionalGeneration"],
+            ["Qwen3VLForConditionalGeneration"],
+            ["MiniMaxM2ForCausalLM"],
+            ["LlamaForCausalLM"],
+            ["GptOssForCausalLM"],
+            ["Step3p5ForCausalLM"],
+            ["NemotronHForCausalLM"],
+            ["Gemma4ForConditionalGeneration"],
+        ]
+
+    @model_validator(mode="before")
+    @classmethod
+    def defer_to_text_config(cls, data: dict[str, Any], info: ValidationInfo):
+        text_config = data.get("text_config")
+        if text_config is not None:
+            for field in [
+                "architectures",
+                "hidden_size",
+                "num_key_value_heads",
+                "max_position_embeddings",
+                "num_hidden_layers",
+                "num_layers",
+                "n_layer",
+                "n_layers",
+                "num_decoder_layers",
+                "decoder_layers",
+            ]:
+                if (val := text_config.get(field)) is not None:  # pyright: ignore[reportAny]
+                    data[field] = val
+
+        vision_config = data.get("vision_config")
+        image_token_id = data.get("image_token_id")
+        if vision_config is not None and image_token_id is not None:
+            model_type = str(
+                data.get("model_type", vision_config.get("model_type", ""))  # pyright: ignore[reportAny]
+            )
+            assert info.context is not None
+
+            data["vision"] = VisionCardConfig(
+                image_token_id=int(image_token_id),  # pyright: ignore[reportAny]
+                model_type=model_type,
+                weights_repo=info.context["model_id"],  # type: ignore
+            )
+
+        return data
+
+
+async def fetch_config_data(model_id: ModelId) -> ConfigData:
+    """Downloads and parses config.json for a model."""
+    from exo.download.download_utils import (
+        download_file_with_retry,
+        resolve_model_dir,
+    )
+
+    target_dir = await resolve_model_dir(model_id)
+    config_path = await download_file_with_retry(
+        model_id,
+        "main",
+        "config.json",
+        target_dir,
+        lambda curr_bytes, total_bytes, is_renamed: logger.debug(
+            f"Downloading config.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
         ),
-    ),
-    "deepseek-v3.1-8bit": ModelCard(
-        short_id="deepseek-v3.1-8bit",
-        model_id=ModelId("mlx-community/DeepSeek-V3.1-8bit"),
-        name="DeepSeek V3.1 (8-bit)",
-        description="""DeepSeek V3.1 is a large language model trained on the DeepSeek V3.1 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/DeepSeek-V3.1-8bit"),
-            pretty_name="DeepSeek V3.1 (8-bit)",
-            storage_size=Memory.from_gb(713),
-            n_layers=61,
+    )
+    async with aiofiles.open(config_path, "r") as f:
+        return ConfigData.model_validate_json(
+            await f.read(), context={"model_id": str(model_id)}
+        )
+
+
+async def fetch_safetensors_size(model_id: ModelId) -> Memory:
+    """Gets model size from safetensors index or falls back to HF API."""
+    from exo.download.download_utils import (
+        download_file_with_retry,
+        resolve_model_dir,
+    )
+    from exo.shared.types.worker.downloads import ModelSafetensorsIndex
+
+    target_dir = await resolve_model_dir(model_id)
+    index_path = await download_file_with_retry(
+        model_id,
+        "main",
+        "model.safetensors.index.json",
+        target_dir,
+        lambda curr_bytes, total_bytes, is_renamed: logger.debug(
+            f"Downloading model.safetensors.index.json for {model_id}: {curr_bytes}/{total_bytes} ({is_renamed=})"
         ),
-    ),
-    # "deepseek-v3.2": ModelCard(
-    #     short_id="deepseek-v3.2",
-    #     model_id=ModelId("mlx-community/DeepSeek-V3.2-8bit"),
-    #     name="DeepSeek V3.2 (8-bit)",
-    #     description="""DeepSeek V3.2 is a large language model trained on the DeepSeek V3.2 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-V3.2-8bit"),
-    #         pretty_name="DeepSeek V3.2 (8-bit)",
-    #         storage_size=Memory.from_kb(754706307),
-    #         n_layers=61,
-    #         hidden_size=7168,
-    #     ),
-    # ),
-    # "deepseek-v3.2-4bit": ModelCard(
-    #     short_id="deepseek-v3.2-4bit",
-    #     model_id=ModelId("mlx-community/DeepSeek-V3.2-4bit"),
-    #     name="DeepSeek V3.2 (4-bit)",
-    #     description="""DeepSeek V3.2 is a large language model trained on the DeepSeek V3.2 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-V3.2-4bit"),
-    #         pretty_name="DeepSeek V3.2 (4-bit)",
-    #         storage_size=Memory.from_kb(754706307 // 2),  # TODO !!!!!
-    #         n_layers=61,
-    #         hidden_size=7168,
-    #     ),
-    # ),
-    # deepseek r1
-    # "deepseek-r1-0528-4bit": ModelCard(
-    #     short_id="deepseek-r1-0528-4bit",
-    #     model_id="mlx-community/DeepSeek-R1-0528-4bit",
-    #     name="DeepSeek-R1-0528 (4-bit)",
-    #     description="""DeepSeek R1 is a large language model trained on the DeepSeek R1 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-R1-0528-4bit"),
-    #         pretty_name="DeepSeek R1 671B (4-bit)",
-    #         storage_size=Memory.from_kb(409706307),
-    #         n_layers=61,
-    #         hidden_size=7168,
-    #     ),
-    # ),
-    # "deepseek-r1-0528": ModelCard(
-    #     short_id="deepseek-r1-0528",
-    #     model_id="mlx-community/DeepSeek-R1-0528-8bit",
-    #     name="DeepSeek-R1-0528 (8-bit)",
-    #     description="""DeepSeek R1 is a large language model trained on the DeepSeek R1 dataset.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/DeepSeek-R1-0528-8bit"),
-    #         pretty_name="DeepSeek R1 671B (8-bit)",
-    #         storage_size=Memory.from_bytes(754998771712),
-    #         n_layers=61,
-    # .       hidden_size=7168,
-    #     ),
-    # ),
-    # kimi k2
-    "kimi-k2-instruct-4bit": ModelCard(
-        short_id="kimi-k2-instruct-4bit",
-        model_id=ModelId("mlx-community/Kimi-K2-Instruct-4bit"),
-        name="Kimi K2 Instruct (4-bit)",
-        description="""Kimi K2 is a large language model trained on the Kimi K2 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Kimi-K2-Instruct-4bit"),
-            pretty_name="Kimi K2 Instruct (4-bit)",
-            storage_size=Memory.from_gb(578),
-            n_layers=61,
-        ),
-    ),
-    "kimi-k2-thinking": ModelCard(
-        short_id="kimi-k2-thinking",
-        model_id=ModelId("mlx-community/Kimi-K2-Thinking"),
-        name="Kimi K2 Thinking (4-bit)",
-        description="""Kimi K2 Thinking is the latest, most capable version of open-source thinking model.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Kimi-K2-Thinking"),
-            pretty_name="Kimi K2 Thinking (4-bit)",
-            storage_size=Memory.from_gb(658),
-            n_layers=61,
-        ),
-    ),
-    # llama-3.1
-    "llama-3.1-8b": ModelCard(
-        short_id="llama-3.1-8b",
-        model_id=ModelId("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
-        name="Llama 3.1 8B (4-bit)",
-        description="""Llama 3.1 is a large language model trained on the Llama 3.1 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
-            pretty_name="Llama 3.1 8B (4-bit)",
-            storage_size=Memory.from_mb(4423),
-            n_layers=32,
-        ),
-    ),
-    "llama-3.1-70b": ModelCard(
-        short_id="llama-3.1-70b",
-        model_id=ModelId("mlx-community/Meta-Llama-3.1-70B-Instruct-4bit"),
-        name="Llama 3.1 70B (4-bit)",
-        description="""Llama 3.1 is a large language model trained on the Llama 3.1 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Meta-Llama-3.1-70B-Instruct-4bit"),
-            pretty_name="Llama 3.1 70B (4-bit)",
-            storage_size=Memory.from_mb(38769),
-            n_layers=80,
-        ),
-    ),
-    # llama-3.2
-    "llama-3.2-1b": ModelCard(
-        short_id="llama-3.2-1b",
-        model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
-        name="Llama 3.2 1B (4-bit)",
-        description="""Llama 3.2 is a large language model trained on the Llama 3.2 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Llama-3.2-1B-Instruct-4bit"),
-            pretty_name="Llama 3.2 1B (4-bit)",
-            storage_size=Memory.from_mb(696),
-            n_layers=16,
-        ),
-    ),
-    "llama-3.2-3b": ModelCard(
-        short_id="llama-3.2-3b",
-        model_id=ModelId("mlx-community/Llama-3.2-3B-Instruct-4bit"),
-        name="Llama 3.2 3B (4-bit)",
-        description="""Llama 3.2 is a large language model trained on the Llama 3.2 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Llama-3.2-3B-Instruct-4bit"),
-            pretty_name="Llama 3.2 3B (4-bit)",
-            storage_size=Memory.from_mb(1777),
-            n_layers=28,
-        ),
-    ),
-    "llama-3.2-3b-8bit": ModelCard(
-        short_id="llama-3.2-3b-8bit",
-        model_id=ModelId("mlx-community/Llama-3.2-3B-Instruct-8bit"),
-        name="Llama 3.2 3B (8-bit)",
-        description="""Llama 3.2 is a large language model trained on the Llama 3.2 dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Llama-3.2-3B-Instruct-8bit"),
-            pretty_name="Llama 3.2 3B (8-bit)",
-            storage_size=Memory.from_mb(3339),
-            n_layers=28,
-        ),
-    ),
-    # llama-3.3
-    "llama-3.3-70b": ModelCard(
-        short_id="llama-3.3-70b",
-        model_id=ModelId("mlx-community/Llama-3.3-70B-Instruct-4bit"),
-        name="Llama 3.3 70B (4-bit)",
-        description="""The Meta Llama 3.3 multilingual large language model (LLM) is an instruction tuned generative model in 70B (text in/text out)""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Llama-3.3-70B-Instruct-4bit"),
-            pretty_name="Llama 3.3 70B",
-            storage_size=Memory.from_mb(38769),
-            n_layers=80,
-        ),
-    ),
-    "llama-3.3-70b-8bit": ModelCard(
-        short_id="llama-3.3-70b-8bit",
-        model_id=ModelId("mlx-community/Llama-3.3-70B-Instruct-8bit"),
-        name="Llama 3.3 70B (8-bit)",
-        description="""The Meta Llama 3.3 multilingual large language model (LLM) is an instruction tuned generative model in 70B (text in/text out)""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Llama-3.3-70B-Instruct-8bit"),
-            pretty_name="Llama 3.3 70B (8-bit)",
-            storage_size=Memory.from_mb(73242),
-            n_layers=80,
-        ),
-    ),
-    "llama-3.3-70b-fp16": ModelCard(
-        short_id="llama-3.3-70b-fp16",
-        model_id=ModelId("mlx-community/llama-3.3-70b-instruct-fp16"),
-        name="Llama 3.3 70B (FP16)",
-        description="""The Meta Llama 3.3 multilingual large language model (LLM) is an instruction tuned generative model in 70B (text in/text out)""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/llama-3.3-70b-instruct-fp16"),
-            pretty_name="Llama 3.3 70B (FP16)",
-            storage_size=Memory.from_mb(137695),
-            n_layers=80,
-        ),
-    ),
-    # phi-3
-    "phi-3-mini": ModelCard(
-        short_id="phi-3-mini",
-        model_id=ModelId("mlx-community/Phi-3-mini-128k-instruct-4bit"),
-        name="Phi 3 Mini 128k (4-bit)",
-        description="""Phi 3 Mini is a large language model trained on the Phi 3 Mini dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Phi-3-mini-128k-instruct-4bit"),
-            pretty_name="Phi 3 Mini 128k (4-bit)",
-            storage_size=Memory.from_mb(2099),
-            n_layers=32,
-        ),
-    ),
-    # qwen3
-    "qwen3-0.6b": ModelCard(
-        short_id="qwen3-0.6b",
-        model_id=ModelId("mlx-community/Qwen3-0.6B-4bit"),
-        name="Qwen3 0.6B (4-bit)",
-        description="""Qwen3 0.6B is a large language model trained on the Qwen3 0.6B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-0.6B-4bit"),
-            pretty_name="Qwen3 0.6B (4-bit)",
-            storage_size=Memory.from_mb(327),
-            n_layers=28,
-        ),
-    ),
-    "qwen3-0.6b-8bit": ModelCard(
-        short_id="qwen3-0.6b-8bit",
-        model_id=ModelId("mlx-community/Qwen3-0.6B-8bit"),
-        name="Qwen3 0.6B (8-bit)",
-        description="""Qwen3 0.6B is a large language model trained on the Qwen3 0.6B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-0.6B-8bit"),
-            pretty_name="Qwen3 0.6B (8-bit)",
-            storage_size=Memory.from_mb(666),
-            n_layers=28,
-        ),
-    ),
-    "qwen3-30b": ModelCard(
-        short_id="qwen3-30b",
-        model_id=ModelId("mlx-community/Qwen3-30B-A3B-4bit"),
-        name="Qwen3 30B A3B (4-bit)",
-        description="""Qwen3 30B is a large language model trained on the Qwen3 30B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-30B-A3B-4bit"),
-            pretty_name="Qwen3 30B A3B (4-bit)",
-            storage_size=Memory.from_mb(16797),
-            n_layers=48,
-        ),
-    ),
-    "qwen3-30b-8bit": ModelCard(
-        short_id="qwen3-30b-8bit",
-        model_id=ModelId("mlx-community/Qwen3-30B-A3B-8bit"),
-        name="Qwen3 30B A3B (8-bit)",
-        description="""Qwen3 30B is a large language model trained on the Qwen3 30B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-30B-A3B-8bit"),
-            pretty_name="Qwen3 30B A3B (8-bit)",
-            storage_size=Memory.from_mb(31738),
-            n_layers=48,
-        ),
-    ),
-    "qwen3-235b-a22b-4bit": ModelCard(
-        short_id="qwen3-235b-a22b-4bit",
-        model_id=ModelId("mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit"),
-        name="Qwen3 235B A22B (4-bit)",
-        description="""Qwen3 235B (Active 22B) is a large language model trained on the Qwen3 235B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-235B-A22B-Instruct-2507-4bit"),
-            pretty_name="Qwen3 235B A22B (4-bit)",
-            storage_size=Memory.from_gb(132),
-            n_layers=94,
-        ),
-    ),
-    "qwen3-235b-a22b-8bit": ModelCard(
-        short_id="qwen3-235b-a22b-8bit",
-        model_id=ModelId("mlx-community/Qwen3-235B-A22B-Instruct-2507-8bit"),
-        name="Qwen3 235B A22B (8-bit)",
-        description="""Qwen3 235B (Active 22B) is a large language model trained on the Qwen3 235B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-235B-A22B-Instruct-2507-8bit"),
-            pretty_name="Qwen3 235B A22B (8-bit)",
-            storage_size=Memory.from_gb(250),
-            n_layers=94,
-        ),
-    ),
-    "qwen3-coder-480b-a35b-4bit": ModelCard(
-        short_id="qwen3-coder-480b-a35b-4bit",
-        model_id=ModelId("mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit"),
-        name="Qwen3 Coder 480B A35B (4-bit)",
-        description="""Qwen3 Coder 480B (Active 35B) is a large language model trained on the Qwen3 Coder 480B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-Coder-480B-A35B-Instruct-4bit"),
-            pretty_name="Qwen3 Coder 480B A35B (4-bit)",
-            storage_size=Memory.from_gb(270),
-            n_layers=62,
-        ),
-    ),
-    "qwen3-coder-480b-a35b-8bit": ModelCard(
-        short_id="qwen3-coder-480b-a35b-8bit",
-        model_id=ModelId("mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit"),
-        name="Qwen3 Coder 480B A35B (8-bit)",
-        description="""Qwen3 Coder 480B (Active 35B) is a large language model trained on the Qwen3 Coder 480B dataset.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/Qwen3-Coder-480B-A35B-Instruct-8bit"),
-            pretty_name="Qwen3 Coder 480B A35B (8-bit)",
-            storage_size=Memory.from_gb(540),
-            n_layers=62,
-        ),
-    ),
-    # granite
-    "granite-3.3-2b": ModelCard(
-        short_id="granite-3.3-2b",
-        model_id=ModelId("mlx-community/granite-3.3-2b-instruct-fp16"),
-        name="Granite 3.3 2B (FP16)",
-        description="""Granite-3.3-2B-Instruct is a 2-billion parameter 128K context length language model fine-tuned for improved reasoning and instruction-following capabilities.""",
-        tags=[],
-        metadata=ModelMetadata(
-            model_id=ModelId("mlx-community/granite-3.3-2b-instruct-fp16"),
-            pretty_name="Granite 3.3 2B (FP16)",
-            storage_size=Memory.from_mb(4951),
-            n_layers=40,
-        ),
-    ),
-    # "granite-3.3-8b": ModelCard(
-    #     short_id="granite-3.3-8b",
-    #     model_id=ModelId("mlx-community/granite-3.3-8b-instruct-fp16"),
-    #     name="Granite 3.3 8B",
-    #     description="""Granite-3.3-8B-Instruct is a 8-billion parameter 128K context length language model fine-tuned for improved reasoning and instruction-following capabilities.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/granite-3.3-8b-instruct-fp16"),
-    #         pretty_name="Granite 3.3 8B",
-    #         storage_size=Memory.from_kb(15958720),
-    #         n_layers=40,
-    #     ),
-    # ),
-    # smol-lm
-    # "smol-lm-135m": ModelCard(
-    #     short_id="smol-lm-135m",
-    #     model_id="mlx-community/SmolLM-135M-4bit",
-    #     name="Smol LM 135M",
-    #     description="""SmolLM is a series of state-of-the-art small language models available in three sizes: 135M, 360M, and 1.7B parameters. """,
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/SmolLM-135M-4bit"),
-    #         pretty_name="Smol LM 135M",
-    #         storage_size=Memory.from_kb(73940),
-    #         n_layers=30,
-    #     ),
-    # ),
-    # gpt-oss
-    # "gpt-oss-120b-MXFP4-Q8": ModelCard(
-    #     short_id="gpt-oss-120b-MXFP4-Q8",
-    #     model_id=ModelId("mlx-community/gpt-oss-120b-MXFP4-Q8"),
-    #     name="GPT-OSS 120B (MXFP4-Q8, MLX)",
-    #     description="""OpenAI's GPT-OSS 120B is a 117B-parameter Mixture-of-Experts model designed for high-reasoning and general-purpose use; this variant is a 4-bit MLX conversion for Apple Silicon.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/gpt-oss-120b-MXFP4-Q8"),
-    #         pretty_name="GPT-OSS 120B (MXFP4-Q8, MLX)",
-    #         storage_size=Memory.from_kb(68_996_301),
-    #         n_layers=36,
-    #         hidden_size=2880,
-    #         supports_tensor=True,
-    #     ),
-    # ),
-    # "gpt-oss-20b-4bit": ModelCard(
-    #     short_id="gpt-oss-20b-4bit",
-    #     model_id=ModelId("mlx-community/gpt-oss-20b-MXFP4-Q4"),
-    #     name="GPT-OSS 20B (MXFP4-Q4, MLX)",
-    #     description="""OpenAI's GPT-OSS 20B is a medium-sized MoE model for lower-latency and local or specialized use cases; this MLX variant uses MXFP4 4-bit quantization.""",
-    #     tags=[],
-    #     metadata=ModelMetadata(
-    #         model_id=ModelId("mlx-community/gpt-oss-20b-MXFP4-Q4"),
-    #         pretty_name="GPT-OSS 20B (MXFP4-Q4, MLX)",
-    #         storage_size=Memory.from_kb(11_744_051),
-    #         n_layers=24,
-    #         hidden_size=2880,
-    #         supports_tensor=True,
-    #     ),
-    # ),
-}
+    )
+    async with aiofiles.open(index_path, "r") as f:
+        index_data = ModelSafetensorsIndex.model_validate_json(await f.read())
+
+    metadata = index_data.metadata
+    if metadata is not None and metadata.total_size is not None:
+        return Memory.from_bytes(metadata.total_size)
+
+    info = model_info(model_id)
+    if info.safetensors is None:
+        raise ValueError(f"No safetensors info found for {model_id}")
+    return Memory.from_bytes(info.safetensors.total)

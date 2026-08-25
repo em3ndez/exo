@@ -1,12 +1,16 @@
-from typing import Self
+import shutil
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Literal, Self
 
 import psutil
 
 from exo.shared.types.memory import Memory
-from exo.utils.pydantic_ext import CamelCaseModel
+from exo.shared.types.thunderbolt import ThunderboltIdentifier
+from exo.utils.pydantic_ext import FrozenModel
 
 
-class MemoryPerformanceProfile(CamelCaseModel):
+class MemoryUsage(FrozenModel):
     ram_total: Memory
     ram_available: Memory
     swap_total: Memory
@@ -36,7 +40,23 @@ class MemoryPerformanceProfile(CamelCaseModel):
         )
 
 
-class SystemPerformanceProfile(CamelCaseModel):
+class DiskUsage(FrozenModel):
+    """Disk space usage for the models directory."""
+
+    total: Memory
+    available: Memory
+
+    @classmethod
+    def from_path(cls, path: Path) -> Self:
+        """Get disk usage stats for the partition containing path."""
+        total, _used, free = shutil.disk_usage(path)
+        return cls(
+            total=Memory.from_bytes(total),
+            available=Memory.from_bytes(free),
+        )
+
+
+class SystemPerformanceProfile(FrozenModel):
     # TODO: flops_fp16: float
 
     gpu_usage: float = 0.0
@@ -44,24 +64,48 @@ class SystemPerformanceProfile(CamelCaseModel):
     sys_power: float = 0.0
     pcpu_usage: float = 0.0
     ecpu_usage: float = 0.0
-    ane_power: float = 0.0
 
 
-class NetworkInterfaceInfo(CamelCaseModel):
+InterfaceType = Literal["wifi", "ethernet", "maybe_ethernet", "thunderbolt", "unknown"]
+
+
+class NetworkInterfaceInfo(FrozenModel):
     name: str
     ip_address: str
+    interface_type: InterfaceType = "unknown"
 
 
-class NodePerformanceProfile(CamelCaseModel):
-    model_id: str
-    chip_id: str
-    friendly_name: str
-    memory: MemoryPerformanceProfile
-    network_interfaces: list[NetworkInterfaceInfo] = []
-    system: SystemPerformanceProfile
+class NodeIdentity(FrozenModel):
+    """Static and slow-changing node identification data."""
+
+    model_id: str = "Unknown"
+    chip_id: str = "Unknown"
+    friendly_name: str = "Unknown"
+    os_version: str = "Unknown"
+    os_build_version: str = "Unknown"
 
 
-class ConnectionProfile(CamelCaseModel):
-    throughput: float
-    latency: float
-    jitter: float
+class NodeNetworkInfo(FrozenModel):
+    """Network interface information for a node."""
+
+    interfaces: Sequence[NetworkInterfaceInfo] = []
+
+
+class NodeThunderboltInfo(FrozenModel):
+    """Thunderbolt interface identifiers for a node."""
+
+    interfaces: Sequence[ThunderboltIdentifier] = []
+
+
+class NodeRdmaCtlStatus(FrozenModel):
+    """Whether RDMA is enabled on this node (via rdma_ctl)."""
+
+    enabled: bool
+
+
+class ThunderboltBridgeStatus(FrozenModel):
+    """Whether the Thunderbolt Bridge network service is enabled on this node."""
+
+    enabled: bool
+    exists: bool
+    service_name: str | None = None

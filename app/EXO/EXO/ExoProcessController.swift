@@ -2,6 +2,33 @@ import AppKit
 import Combine
 import Foundation
 
+private let customNamespaceKey = "EXOCustomNamespace"
+private let hfTokenKey = "EXOHFToken"
+private let hfEndpointKey = "EXOHFEndpoint"
+private let enableImageModelsKey = "EXOEnableImageModels"
+private let offlineModeKey = "EXOOfflineMode"
+private let fastSynchEnabledKey = "EXOFastSynchEnabled"
+private let onboardingCompletedKey = "EXOOnboardingCompleted"
+private let defaultModelsDirKey = "EXODefaultModelsDir"
+private let additionalModelsDirsKey = "EXOAdditionalModelsDirs"
+private let readOnlyModelsDirsKey = "EXOReadOnlyModelsDirs"
+private let customEnvironmentVariablesKey = "EXOCustomEnvironmentVariables"
+
+/// A user-defined environment variable that is injected into the exo child
+/// process at launch. Used as an escape hatch for env vars that don't have
+/// first-class typed UI in Settings.
+struct CustomEnvironmentVariable: Codable, Identifiable, Equatable {
+    var id: UUID
+    var key: String
+    var value: String
+
+    init(id: UUID = UUID(), key: String = "", value: String = "") {
+        self.id = id
+        self.key = key
+        self.value = value
+    }
+}
+
 @MainActor
 final class ExoProcessController: ObservableObject {
     enum Status: Equatable {
@@ -24,9 +51,110 @@ final class ExoProcessController: ObservableObject {
         }
     }
 
+    static let exoDirectoryURL: URL = {
+        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".exo")
+    }()
+
     @Published private(set) var status: Status = .stopped
     @Published private(set) var lastError: String?
     @Published private(set) var launchCountdownSeconds: Int?
+    @Published var customNamespace: String = {
+        return UserDefaults.standard.string(forKey: customNamespaceKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(customNamespace, forKey: customNamespaceKey)
+        }
+    }
+    @Published var hfToken: String = {
+        return UserDefaults.standard.string(forKey: hfTokenKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(hfToken, forKey: hfTokenKey)
+        }
+    }
+    @Published var hfEndpoint: String = {
+        return UserDefaults.standard.string(forKey: hfEndpointKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(hfEndpoint, forKey: hfEndpointKey)
+        }
+    }
+    @Published var enableImageModels: Bool = {
+        return UserDefaults.standard.bool(forKey: enableImageModelsKey)
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(enableImageModels, forKey: enableImageModelsKey)
+        }
+    }
+    @Published var offlineMode: Bool = {
+        return UserDefaults.standard.bool(forKey: offlineModeKey)
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(offlineMode, forKey: offlineModeKey)
+        }
+    }
+    @Published var fastSynchEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: fastSynchEnabledKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: fastSynchEnabledKey)
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(fastSynchEnabled, forKey: fastSynchEnabledKey)
+        }
+    }
+    @Published var defaultModelsDir: String = {
+        return UserDefaults.standard.string(forKey: defaultModelsDirKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(defaultModelsDir, forKey: defaultModelsDirKey)
+        }
+    }
+    @Published var additionalModelsDirs: String = {
+        return UserDefaults.standard.string(forKey: additionalModelsDirsKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(additionalModelsDirs, forKey: additionalModelsDirsKey)
+        }
+    }
+    @Published var readOnlyModelsDirs: String = {
+        return UserDefaults.standard.string(forKey: readOnlyModelsDirsKey) ?? ""
+    }()
+    {
+        didSet {
+            UserDefaults.standard.set(readOnlyModelsDirs, forKey: readOnlyModelsDirsKey)
+        }
+    }
+    @Published var customEnvironmentVariables: [CustomEnvironmentVariable] = {
+        guard
+            let data = UserDefaults.standard.data(forKey: customEnvironmentVariablesKey),
+            let decoded = try? JSONDecoder().decode(
+                [CustomEnvironmentVariable].self, from: data
+            )
+        else {
+            return []
+        }
+        return decoded
+    }()
+    {
+        didSet {
+            guard let data = try? JSONEncoder().encode(customEnvironmentVariables) else {
+                return
+            }
+            UserDefaults.standard.set(data, forKey: customEnvironmentVariablesKey)
+        }
+    }
+
+    /// Fires once when EXO transitions to `.running` for the very first time (fresh install).
+    @Published private(set) var isFirstLaunchReady = false
 
     private var process: Process?
     private var runtimeDirectoryURL: URL?
@@ -50,7 +178,11 @@ final class ExoProcessController: ObservableObject {
 
             let child = Process()
             child.executableURL = executableURL
-            child.currentDirectoryURL = runtimeURL
+            let exoHomeURL = Self.exoDirectoryURL
+            try? FileManager.default.createDirectory(
+                at: exoHomeURL, withIntermediateDirectories: true
+            )
+            child.currentDirectoryURL = exoHomeURL
             child.environment = makeEnvironment(for: runtimeURL)
 
             child.standardOutput = FileHandle.nullDevice
@@ -77,6 +209,9 @@ final class ExoProcessController: ObservableObject {
             try child.run()
             process = child
             status = .running
+
+            // Show welcome popout on every launch
+            isFirstLaunchReady = true
         } catch {
             process = nil
             status = .failed(message: "Launch error")
@@ -90,16 +225,53 @@ final class ExoProcessController: ObservableObject {
             return
         }
         process.terminationHandler = nil
-        if process.isRunning {
-            process.terminate()
-        }
-        self.process = nil
         status = .stopped
+
+        guard process.isRunning else {
+            self.process = nil
+            return
+        }
+
+        let proc = process
+        self.process = nil
+
+        Task.detached {
+            proc.interrupt()
+
+            for _ in 0..<50 {
+                if !proc.isRunning { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            if proc.isRunning {
+                proc.terminate()
+            }
+
+            for _ in 0..<30 {
+                if !proc.isRunning { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            if proc.isRunning {
+                kill(proc.processIdentifier, SIGKILL)
+            }
+        }
     }
 
     func restart() {
         stop()
         launch()
+    }
+
+    /// Mark onboarding as completed (user interacted with the welcome popout).
+    func markOnboardingCompleted() {
+        UserDefaults.standard.set(true, forKey: onboardingCompletedKey)
+    }
+
+    /// Reset onboarding so the welcome popout appears on next launch.
+    func resetOnboarding() {
+        UserDefaults.standard.removeObject(forKey: onboardingCompletedKey)
+        isFirstLaunchReady = false
     }
 
     func scheduleLaunch(after seconds: TimeInterval) {
@@ -180,7 +352,20 @@ final class ExoProcessController: ObservableObject {
     private func makeEnvironment(for runtimeURL: URL) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
         environment["EXO_RUNTIME_DIR"] = runtimeURL.path
-        environment["EXO_LIBP2P_NAMESPACE"] = buildTag()
+        environment["EXO_ZENOH_NAMESPACE"] = computeNamespace()
+        if !hfToken.isEmpty {
+            environment["HF_TOKEN"] = hfToken
+        }
+        if !hfEndpoint.isEmpty {
+            environment["HF_ENDPOINT"] = hfEndpoint
+        }
+        if enableImageModels {
+            environment["EXO_ENABLE_IMAGE_MODELS"] = "true"
+        }
+        if offlineMode {
+            environment["EXO_OFFLINE"] = "true"
+        }
+        environment["EXO_FAST_SYNCH"] = fastSynchEnabled ? "true" : "false"
 
         var paths: [String] = []
         if let existing = environment["PATH"], !existing.isEmpty {
@@ -205,6 +390,29 @@ final class ExoProcessController: ObservableObject {
         }
 
         environment["PATH"] = paths.joined(separator: ":")
+
+        let trimmedDefaultModelsDir = defaultModelsDir.trimmingCharacters(in: .whitespaces)
+        if !trimmedDefaultModelsDir.isEmpty {
+            environment["EXO_DEFAULT_MODELS_DIR"] = trimmedDefaultModelsDir
+        }
+        let trimmedAdditionalModelsDirs = additionalModelsDirs.trimmingCharacters(in: .whitespaces)
+        if !trimmedAdditionalModelsDirs.isEmpty {
+            environment["EXO_MODELS_DIRS"] = trimmedAdditionalModelsDirs
+        }
+        let trimmedReadOnlyModelsDirs = readOnlyModelsDirs.trimmingCharacters(in: .whitespaces)
+        if !trimmedReadOnlyModelsDirs.isEmpty {
+            environment["EXO_MODELS_READ_ONLY_DIRS"] = trimmedReadOnlyModelsDirs
+        }
+
+        // Apply user-defined arbitrary environment variables last so that
+        // power users can override any of the typed fields above when
+        // necessary. Empty keys are ignored.
+        for variable in customEnvironmentVariables {
+            let trimmedKey = variable.key.trimmingCharacters(in: .whitespaces)
+            guard !trimmedKey.isEmpty else { continue }
+            environment[trimmedKey] = variable.value
+        }
+
         return environment
     }
 
@@ -212,10 +420,18 @@ final class ExoProcessController: ObservableObject {
         if let tag = Bundle.main.infoDictionary?["EXOBuildTag"] as? String, !tag.isEmpty {
             return tag
         }
-        if let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String, !short.isEmpty {
+        if let short = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String,
+            !short.isEmpty
+        {
             return short
         }
         return "dev"
+    }
+
+    private func computeNamespace() -> String {
+        let base = buildTag()
+        let custom = customNamespace.trimmingCharacters(in: .whitespaces)
+        return custom.isEmpty ? base : custom
     }
 }
 
